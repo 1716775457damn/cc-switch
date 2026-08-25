@@ -2670,16 +2670,17 @@ wire_api = "responses"
                 )
                 .as_deref(),
                 Some("cli-refresh-b1"),
-                "B's CLI generation must be adopted before third-party auth overwrites auth.json"
+                "B's CLI generation must be adopted before the third-party switch removes auth.json"
             );
-            let live_third_party: Value =
-                read_json_file(&crate::codex_config::get_codex_auth_path())
-                    .expect("read third-party auth");
-            assert_eq!(
-                live_third_party
-                    .get("OPENAI_API_KEY")
-                    .and_then(Value::as_str),
-                Some("sk-third-party")
+            assert!(
+                !crate::codex_config::get_codex_auth_path().exists(),
+                "third-party switches are config-only: auth.json is removed"
+            );
+            let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+                .expect("read third-party config");
+            assert!(
+                live_config.contains("experimental_bearer_token = \"sk-third-party\""),
+                "the third-party key rides in config.toml; got:\n{live_config}"
             );
         });
     }
@@ -3603,10 +3604,15 @@ wire_api = "responses"
             crate::settings::reload_settings().expect("reload settings");
 
             // 基线：一个普通第三方 provider，可正常切换，作为初始 current。
+            // config 必须带自定义 provider 表：config-only 切换要求 key 有
+            // provider 级落点。
             let mut baseline = Provider::with_id(
                 "baseline".to_string(),
                 "Baseline".to_string(),
-                json!({ "auth": { "OPENAI_API_KEY": "sk-baseline" }, "config": "" }),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "sk-baseline" },
+                    "config": "model_provider = \"baseline\"\n[model_providers.baseline]\nbase_url = \"https://baseline.example/v1\"\n"
+                }),
                 None,
             );
             baseline.category = Some("custom".to_string());

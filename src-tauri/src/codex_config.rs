@@ -398,6 +398,7 @@ impl CodexCatalogToolProfile {
 /// removed provider aliases.
 const CODEX_RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[
     "amazon-bedrock",
+    "amazon-bedrock-runtime",
     "openai",
     "ollama",
     "lmstudio",
@@ -2520,11 +2521,13 @@ pub fn extract_codex_experimental_bearer_token(config_text: &str) -> Option<Stri
             .and_then(|item| item.as_str())
     };
     let token = match provider_id.as_deref() {
+        // `as_table_like` (not `as_table`): user configs may use inline tables
+        // (`model_providers = { foo = {...} }`), which `as_table` rejects.
         Some(id) if is_custom_codex_model_provider_id(id) => doc
             .get("model_providers")
-            .and_then(|item| item.as_table())
+            .and_then(|item| item.as_table_like())
             .and_then(|table| table.get(id))
-            .and_then(|item| item.as_table())
+            .and_then(|item| item.as_table_like())
             .and_then(|table| table.get("experimental_bearer_token"))
             .and_then(|item| item.as_str())
             .or_else(top_level_token),
@@ -2536,6 +2539,198 @@ pub fn extract_codex_experimental_bearer_token(config_text: &str) -> Option<Stri
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
+}
+
+/// Whether a provider's `http_headers` / `env_http_headers` table carries an
+/// `Authorization` entry. Header names are case-insensitive on the wire, so
+/// match TOML keys case-insensitively too.
+fn table_declares_authorization_header(item: Option<&toml_edit::Item>) -> bool {
+    item.and_then(|item| item.as_table_like())
+        .is_some_and(|table| {
+            table
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("authorization"))
+        })
+}
+
+/// Codex 0.149 guard: a provider table that already declares its own
+/// credential source must not receive an injected bearer token. `auth` /
+/// `aws` sub-tables hard-conflict with `experimental_bearer_token` at
+/// deserialization — the whole config.toml fails to parse and Codex refuses
+/// to start. `env_key` outranks the token at runtime, so injection buys
+/// nothing and only leaks the key into config.toml. An explicit
+/// `Authorization` in `http_headers` / `env_http_headers` is how header-auth
+/// providers survive on 0.149 — auth is applied after provider headers and
+/// would overwrite it.
+///
+/// `requires_openai_auth` is deliberately NOT part of this guard, and it
+/// even disables the header check: without an injected token,
+/// `requires_openai_auth = true` routes auth to the preserved `auth.json`
+/// OAuth login, which is applied after provider headers and would send the
+/// official credentials to the third-party endpoint. The injected token
+/// short-circuits that (the preservation-mode bridge contract); a
+/// contradictory Authorization header loses either way on 0.149.
+fn codex_provider_table_declares_auth(table: &dyn toml_edit::TableLike) -> bool {
+    let requires_openai_auth = table
+        .get("requires_openai_auth")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    table.get("auth").is_some()
+        || table.get("aws").is_some()
+        || table.get("env_key").is_some()
+        || (!requires_openai_auth
+            && (table_declares_authorization_header(table.get("http_headers"))
+                || table_declares_authorization_header(table.get("env_http_headers"))))
+}
+
+/// Whether a config routes requests away from the official provider while
+/// offering no custom provider table to carry a bearer token: a custom
+/// `model_provider` whose table is missing, or a built-in/unset provider
+/// rerouted by a top-level `openai_base_url`. In both shapes the token can
+/// only land at the top level, which Codex 0.149 ignores — on a config-only
+/// switch the preserved `auth.json` credentials would be sent to the
+/// third-party endpoint. Configs without any routing directive are fine:
+/// they leave Codex on the official provider, and the top-level token is
+/// cc-switch's own record (extract/backfill), never read by Codex.
+fn codex_config_routes_third_party_without_token_slot(config_text: &str) -> bool {
+    let Ok(doc) = config_text.parse::<DocumentMut>() else {
+        // Syntactically invalid TOML is rejected later by the write validators.
+        return false;
+    };
+    match active_codex_model_provider_id(&doc) {
+        Some(id) if is_custom_codex_model_provider_id(&id) => doc
+            .get("model_providers")
+            .and_then(|item| item.as_table_like())
+            .and_then(|table| table.get(&id))
+            .and_then(|item| item.as_table_like())
+            .is_none(),
+        _ => doc
+            .get("openai_base_url")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .is_some_and(|url| !url.is_empty()),
+    }
+}
+
+/// Whether a config with NO injectable API key still routes third-party
+/// traffic through the `auth.json` fallback. On 0.149 a custom provider
+/// with `requires_openai_auth = true` and no credentials of its own
+/// (`env_key` errs hard before the fallback; an `auth`/`aws` subtable
+/// replaces the auth manager entirely) resolves to whatever `auth.json`
+/// holds — under login preservation that is the official OAuth login,
+/// applied after provider headers, so even an explicit
+/// `http_headers.Authorization` is overwritten and the ChatGPT access
+/// token + account id go to the third-party endpoint. A top-level
+/// `openai_base_url` reroutes the built-in `openai` provider the same way
+/// (other built-ins never read the OAuth login). With a token present the
+/// injected bearer short-circuits the fallback instead (bridge contract),
+/// so this predicate only matters on the no-token path.
+fn codex_config_falls_back_to_official_auth_for_third_party(config_text: &str) -> bool {
+    let Ok(doc) = config_text.parse::<DocumentMut>() else {
+        // Syntactically invalid TOML is rejected later by the write validators.
+        return false;
+    };
+    let openai_base_url_reroutes = || {
+        doc.get("openai_base_url")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .is_some_and(|url| !url.is_empty())
+    };
+    match active_codex_model_provider_id(&doc) {
+        Some(id) if is_custom_codex_model_provider_id(&id) => doc
+            .get("model_providers")
+            .and_then(|item| item.as_table_like())
+            .and_then(|table| table.get(&id))
+            .and_then(|item| item.as_table_like())
+            .is_some_and(|table| {
+                table
+                    .get("requires_openai_auth")
+                    .and_then(|item| item.as_bool())
+                    .unwrap_or(false)
+                    && table.get("env_key").is_none()
+                    && table.get("auth").is_none()
+                    && table.get("aws").is_none()
+            }),
+        Some(id) if id.eq_ignore_ascii_case("openai") => openai_base_url_reroutes(),
+        None => openai_base_url_reroutes(),
+        // Other reserved built-ins (ollama, lmstudio, bedrock…) have their
+        // own auth paths and never fall back to the OAuth login.
+        Some(_) => false,
+    }
+}
+
+/// cc-switch-owned provider id used by the legacy-shape normalization below.
+/// Not a Codex reserved id, so an injected token lands inside the table.
+const CODEX_MIGRATED_PROVIDER_ID: &str = "cc-switch";
+
+/// Rewrite the legacy "reroute the built-in openai provider" shape —
+/// `model_provider` unset/"openai" plus a top-level `openai_base_url` — into
+/// a custom provider table named `cc-switch`. Before Codex 0.149 this shape
+/// worked because the built-in provider read the third-party key from
+/// auth.json (ambient auth); auth.json no longer carries third-party keys,
+/// so the key needs a provider-scoped slot. The built-in `openai` provider
+/// speaks the Responses wire protocol, so the table pins
+/// `wire_api = "responses"` and traffic semantics stay unchanged. The table
+/// name is deliberately not "OpenAI" — the remote-compaction helpers treat
+/// that display name as a signal. Idempotent: a normalized config keeps no
+/// top-level `openai_base_url`, and an existing `cc-switch` table is ours to
+/// overwrite. Returns None when the shape does not apply.
+fn normalize_codex_legacy_openai_reroute(config_text: &str) -> Result<Option<String>, AppError> {
+    if !config_text.contains("openai_base_url") {
+        return Ok(None);
+    }
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+
+    let targets_built_in_openai = match active_codex_model_provider_id(&doc) {
+        None => true,
+        Some(id) => id.eq_ignore_ascii_case("openai"),
+    };
+    if !targets_built_in_openai {
+        return Ok(None);
+    }
+    let Some(base_url) = doc
+        .get("openai_base_url")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+    // An inline `model_providers` next to a built-in reroute is a shape we
+    // do not understand — leave it to the safety gates instead of guessing.
+    if let Some(item) = doc.get("model_providers") {
+        if item.as_table().is_none() {
+            return Ok(None);
+        }
+    }
+
+    doc.as_table_mut().remove("openai_base_url");
+    doc["model_provider"] = toml_edit::value(CODEX_MIGRATED_PROVIDER_ID);
+
+    if doc.get("model_providers").is_none() {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(true);
+        doc.insert("model_providers", toml_edit::Item::Table(table));
+    }
+    let Some(model_providers) = doc
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_mut())
+    else {
+        return Ok(None);
+    };
+    let mut provider_table = toml_edit::Table::new();
+    provider_table.insert("name", toml_edit::value("Custom"));
+    provider_table.insert("base_url", toml_edit::value(base_url));
+    provider_table.insert("wire_api", toml_edit::value("responses"));
+    model_providers.insert(
+        CODEX_MIGRATED_PROVIDER_ID,
+        toml_edit::Item::Table(provider_table),
+    );
+
+    Ok(Some(doc.to_string()))
 }
 
 fn set_codex_experimental_bearer_token(config_text: &str, token: &str) -> Result<String, AppError> {
@@ -2563,17 +2758,21 @@ fn set_codex_experimental_bearer_token(config_text: &str, token: &str) -> Result
         return Ok(doc.to_string());
     }
 
-    if let Some(model_providers) = doc
+    // `as_table_like_mut` (not `as_table_mut`): inline tables would return
+    // None and silently divert the token to the top level, where Codex 0.149
+    // has no such field and ignores it (401 persists). Same pitfall as
+    // `update_codex_toml_field`.
+    if let Some(provider_table) = doc
         .get_mut("model_providers")
-        .and_then(|item| item.as_table_mut())
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|table| table.get_mut(provider_id.as_str()))
+        .and_then(|item| item.as_table_like_mut())
     {
-        if let Some(provider_table) = model_providers
-            .get_mut(provider_id.as_str())
-            .and_then(|item| item.as_table_mut())
-        {
-            provider_table["experimental_bearer_token"] = toml_edit::value(token);
-            return Ok(doc.to_string());
+        if codex_provider_table_declares_auth(&*provider_table) {
+            return Ok(config_text.to_string());
         }
+        provider_table.insert("experimental_bearer_token", toml_edit::value(token));
+        return Ok(doc.to_string());
     }
 
     doc["experimental_bearer_token"] = toml_edit::value(token);
@@ -2595,9 +2794,9 @@ pub fn remove_codex_experimental_bearer_token_if(
     if let Some(provider_id) = active_codex_model_provider_id(&doc) {
         if let Some(provider_table) = doc
             .get_mut("model_providers")
-            .and_then(|item| item.as_table_mut())
+            .and_then(|item| item.as_table_like_mut())
             .and_then(|table| table.get_mut(provider_id.as_str()))
-            .and_then(|item| item.as_table_mut())
+            .and_then(|item| item.as_table_like_mut())
         {
             let should_remove = provider_table
                 .get("experimental_bearer_token")
@@ -2994,25 +3193,102 @@ pub fn write_codex_live_for_provider(
     auth: &Value,
     config_text: Option<&str>,
 ) -> Result<(), AppError> {
-    let unified_official_config =
-        if category == Some("official") && crate::settings::unify_codex_session_history() {
+    if category == Some("official") {
+        let unified_official_config = if crate::settings::unify_codex_session_history() {
             Some(inject_codex_unified_session_bucket(
                 config_text.unwrap_or(""),
             )?)
         } else {
             None
         };
-    let config_text = unified_official_config.as_deref().or(config_text);
+        let config_text = unified_official_config.as_deref().or(config_text);
+        // Official cards own auth.json: a material-carrying login is written
+        // in full, a material-less card follows the live login and only
+        // writes config. Official auth never travels through config.toml.
+        return if codex_auth_has_login_material(auth) {
+            write_codex_live_atomic(auth, config_text)
+        } else {
+            write_codex_live_config_atomic(config_text)
+        };
+    }
 
-    let should_write_auth = (category == Some("official") && codex_auth_has_login_material(auth))
-        || (category != Some("official")
-            && !crate::settings::preserve_codex_official_auth_on_switch());
+    // Third-party switches are config-only. Since Codex 0.149
+    // (openai/codex#39214) custom providers no longer inherit ambient auth
+    // from auth.json, so the API key travels as a provider-scoped
+    // `experimental_bearer_token` in config.toml (honored since Codex 0.48).
+    // auth.json is reserved for the official ChatGPT login: kept when the
+    // preservation setting is on, deleted otherwise. It never carries
+    // third-party keys, so a `requires_openai_auth = true` fallback has no
+    // third-party credential to mis-send and pre-0.48 auth.json-only Codex
+    // releases are the only casualty.
+    // The key may live in auth.OPENAI_API_KEY or already sit in the config
+    // text (e.g. `auth = {}` raw-edited providers) — mirror
+    // prepare_codex_provider_live_config's token sources.
+    let carried_key = extract_codex_api_key(Some(auth), config_text);
 
-    if should_write_auth {
-        write_codex_live_atomic(auth, config_text)
-    } else {
-        let live_config = prepare_codex_provider_live_config(auth, config_text.unwrap_or(""))?;
-        write_codex_live_config_atomic(Some(&live_config))
+    // The legacy reroute shape (built-in `openai` provider + top-level
+    // `openai_base_url`) has no provider table to carry the key — rewrite it
+    // into a cc-switch-owned custom table before the safety gates run.
+    let normalized = match config_text {
+        Some(text) if carried_key.is_some() => normalize_codex_legacy_openai_reroute(text)?,
+        _ => None,
+    };
+    let config_text = normalized.as_deref().or(config_text);
+
+    match config_text {
+        Some(text) if !text.trim().is_empty() => {
+            // Both safety gates protect the same invariant: the auth Codex
+            // resolves for a third-party route must never come from
+            // auth.json (official OAuth under preservation, nothing at all
+            // otherwise — either way the switch would be broken or unsafe).
+            if carried_key.is_some() && codex_config_routes_third_party_without_token_slot(text) {
+                return Err(AppError::localized(
+                    "provider.codex.config.no_custom_provider",
+                    "Codex 第三方配置必须包含自定义 model_providers 条目以承载 API 密钥（Codex 不识别顶层 experimental_bearer_token）",
+                    "A Codex third-party config must define a custom model_providers entry to carry the API key (Codex ignores a top-level experimental_bearer_token)",
+                ));
+            }
+            if carried_key.is_none()
+                && codex_config_falls_back_to_official_auth_for_third_party(text)
+            {
+                return Err(AppError::localized(
+                    "provider.codex.config.official_auth_fallback",
+                    "该 Codex 配置没有可用的 API 密钥，而 requires_openai_auth = true（或顶层 openai_base_url）会让 Codex 回退使用 auth.json 里的登录凭据访问第三方地址。请为供应商填写 API 密钥，或移除该回退指令",
+                    "This Codex config has no usable API key, and requires_openai_auth = true (or a top-level openai_base_url) would make Codex fall back to whatever login auth.json holds for a third-party route. Add an API key to the provider or remove the fallback directive",
+                ));
+            }
+            let live_config = prepare_codex_provider_live_config(auth, text)?;
+            write_codex_live_config_atomic(Some(&live_config))?;
+        }
+        other => {
+            // Empty config: with a key to carry this errs inside
+            // set_codex_experimental_bearer_token (no table to attach it
+            // to); without a key the empty config is written as-is.
+            let live_config = prepare_codex_provider_live_config(auth, other.unwrap_or(""))?;
+            write_codex_live_config_atomic(Some(&live_config))?;
+        }
+    }
+
+    // The preservation setting now means exactly one thing: does the
+    // official login in auth.json survive a third-party switch? Off means
+    // the file is deleted — a lingering login next to a third-party route is
+    // the leak shape the gates exist to prevent, and `{}` is not logout, the
+    // file must go (see clear_stale_codex_live_auth_after_official_switch).
+    // Config is already committed at this point, so a cleanup failure
+    // degrades to a warning instead of reporting an unswitched state.
+    if !crate::settings::preserve_codex_official_auth_on_switch() {
+        remove_codex_live_auth_after_third_party_switch();
+    }
+    Ok(())
+}
+
+fn remove_codex_live_auth_after_third_party_switch() {
+    let auth_path = get_codex_auth_path();
+    if !auth_path.exists() {
+        return;
+    }
+    if let Err(e) = delete_file(&auth_path) {
+        log::warn!("Failed to remove auth.json after a third-party Codex switch: {e}");
     }
 }
 
@@ -3882,6 +4158,352 @@ model = "gpt-5"
                 .and_then(|v| v.as_str()),
             Some("sk-test")
         );
+        assert!(
+            parsed.get("model_providers").is_none(),
+            "reserved provider tables should not be synthesized"
+        );
+    }
+
+    #[test]
+    fn bearer_token_round_trips_through_inline_provider_tables() {
+        // Inline tables (`model_providers = { ... }`) are valid TOML that
+        // `as_table` rejects; the token must still land inside the provider
+        // table — a top-level fallback is ignored by Codex 0.149 (401 persists).
+        let input = r#"model_provider = "aihubmix"
+model_providers = { aihubmix = { name = "AiHubMix", base_url = "https://aihubmix.example/v1" } }
+"#;
+
+        let output =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-inline"}), input)
+                .expect("prepare live config");
+        let parsed: toml::Value = toml::from_str(&output).expect("parse output");
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|v| v.get("aihubmix"))
+                .and_then(|v| v.get("experimental_bearer_token"))
+                .and_then(|v| v.as_str()),
+            Some("sk-inline"),
+            "token must land inside the inline provider table; got:\n{output}"
+        );
+        assert!(
+            parsed.get("experimental_bearer_token").is_none(),
+            "token must not leak to the top level for a custom provider"
+        );
+
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&output).as_deref(),
+            Some("sk-inline"),
+            "extraction must read the token back out of an inline provider table"
+        );
+
+        let cleaned = remove_codex_experimental_bearer_token(&output).expect("remove token");
+        assert!(
+            !cleaned.contains("experimental_bearer_token"),
+            "removal must strip the token from an inline provider table; got:\n{cleaned}"
+        );
+    }
+
+    #[test]
+    fn prepare_provider_live_config_skips_tables_with_explicit_auth() {
+        // Codex 0.149 rejects `experimental_bearer_token` alongside `auth` /
+        // `aws` at deserialization (the whole config fails to parse), and
+        // `env_key` outranks the token at runtime, so injection buys nothing.
+        // All three shapes must be left untouched.
+        for provider_table in [
+            "env_key = \"AZURE_OPENAI_API_KEY\"",
+            "auth = { command = \"my-auth-helper\" }",
+            "aws = { region = \"us-east-1\" }",
+            // Header-based auth survives 0.149 only if we leave it alone: the
+            // injected bearer would be applied after provider headers and
+            // overwrite the explicit Authorization. Header names are
+            // case-insensitive.
+            "http_headers = { Authorization = \"Bearer header-token\" }",
+            "http_headers = { authorization = \"Bearer header-token\" }",
+            "env_http_headers = { AUTHORIZATION = \"MY_AUTH_ENV_VAR\" }",
+        ] {
+            let input = format!(
+                r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://example.com/v1"
+{provider_table}
+"#
+            );
+
+            let output =
+                prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), &input)
+                    .expect("prepare live config");
+            assert_eq!(
+                output, input,
+                "provider table declaring `{provider_table}` must not receive an injected token"
+            );
+        }
+
+        // `requires_openai_auth = true` must NOT suppress injection: the token
+        // outranks it at runtime, which is exactly what keeps a preserved
+        // official OAuth login from being sent to a third-party endpoint.
+        let bridge_input = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://example.com/v1"
+requires_openai_auth = true
+"#;
+        let output =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), bridge_input)
+                .expect("prepare live config");
+        let parsed: toml::Value = toml::from_str(&output).expect("parse output");
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|v| v.get("custom"))
+                .and_then(|v| v.get("experimental_bearer_token"))
+                .and_then(|v| v.as_str()),
+            Some("sk-test"),
+            "requires_openai_auth tables must still receive the token (bridge contract)"
+        );
+
+        // requires_openai_auth = true disables the header guard too: without
+        // the token, Codex would fall back to the preserved official OAuth
+        // (applied after provider headers) and send it to the third-party
+        // endpoint. The bridge contract outranks a contradictory header.
+        let contradictory_input = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://example.com/v1"
+requires_openai_auth = true
+http_headers = { Authorization = "Bearer header-token" }
+"#;
+        let output = prepare_codex_provider_live_config(
+            &json!({"OPENAI_API_KEY": "sk-test"}),
+            contradictory_input,
+        )
+        .expect("prepare live config");
+        assert!(
+            output.contains("experimental_bearer_token = \"sk-test\""),
+            "requires_openai_auth must re-enable injection despite an Authorization header; got:\n{output}"
+        );
+
+        // Non-Authorization headers are not credentials — injection proceeds.
+        let plain_headers_input = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://example.com/v1"
+http_headers = { x-api-version = "2026-01-01" }
+"#;
+        let output = prepare_codex_provider_live_config(
+            &json!({"OPENAI_API_KEY": "sk-test"}),
+            plain_headers_input,
+        )
+        .expect("prepare live config");
+        assert!(
+            output.contains("experimental_bearer_token = \"sk-test\""),
+            "plain http_headers without Authorization must not suppress injection; got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn third_party_route_without_token_slot_detection() {
+        // Dangerous shapes: routing points away from the official provider
+        // but the token has no provider table to land in.
+        for dangerous in [
+            // custom id but its table is missing
+            "model_provider = \"aihubmix\"\n",
+            // built-in provider rerouted to a third party
+            "openai_base_url = \"https://relay.example/v1\"\n",
+            "model_provider = \"openai\"\nopenai_base_url = \"https://relay.example/v1\"\n",
+        ] {
+            assert!(
+                codex_config_routes_third_party_without_token_slot(dangerous),
+                "shape must be flagged (third-party route, no token slot):\n{dangerous}"
+            );
+        }
+
+        // Safe shapes: either the token has a landing spot, or nothing
+        // reroutes requests away from the official provider (top-level token
+        // stays a cc-switch-only record).
+        let custom_with_table = r#"model_provider = "aihubmix"
+
+[model_providers.aihubmix]
+base_url = "https://aihubmix.example/v1"
+"#;
+        let custom_inline_table = r#"model_provider = "aihubmix"
+model_providers = { aihubmix = { base_url = "https://aihubmix.example/v1" } }
+"#;
+        for safe in [
+            custom_with_table,
+            custom_inline_table,
+            // no routing directive at all (e.g. an MCP-only config)
+            "model = \"gpt-5\"\n",
+            "[mcp_servers.echo]\ncommand = \"echo\"\n",
+            // explicit built-in provider without a reroute
+            "model_provider = \"openai\"\n",
+        ] {
+            assert!(
+                !codex_config_routes_third_party_without_token_slot(safe),
+                "shape must not be flagged:\n{safe}"
+            );
+        }
+    }
+
+    #[test]
+    fn official_auth_fallback_for_third_party_detection() {
+        // Dangerous shapes: with no injectable key, auth resolution falls
+        // back to `auth.json` while requests go to a third-party endpoint.
+        let header_auth_with_fallback = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://relay.example/v1"
+requires_openai_auth = true
+http_headers = { Authorization = "Bearer explicit-header-token" }
+"#;
+        for dangerous in [
+            header_auth_with_fallback,
+            // bare fallback flag, no credentials anywhere
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\n",
+            // built-in openai rerouted to a third party
+            "openai_base_url = \"https://relay.example/v1\"\n",
+            "model_provider = \"openai\"\nopenai_base_url = \"https://relay.example/v1\"\n",
+        ] {
+            assert!(
+                codex_config_falls_back_to_official_auth_for_third_party(dangerous),
+                "shape must be flagged (auth.json fallback on a third-party route):\n{dangerous}"
+            );
+        }
+
+        for safe in [
+            // no fallback flag: 0.149 resolves this as unauthenticated and
+            // the provider's own headers survive (header-auth contract)
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nhttp_headers = { Authorization = \"Bearer k\" }\n",
+            // provider-own credentials outrank / replace the fallback
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nenv_key = \"MY_KEY\"\n",
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nauth = { type = \"oauth\" }\n",
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\naws = { region = \"us-east-1\" }\n",
+            // no routing directive at all: stays on the official provider
+            "model = \"gpt-5\"\n",
+            "[mcp_servers.echo]\ncommand = \"echo\"\n",
+            "model_provider = \"openai\"\n",
+            // custom id with a missing table: Codex refuses to start, no leak
+            "model_provider = \"custom\"\n",
+            // openai_base_url is inert for non-openai built-ins
+            "model_provider = \"ollama\"\nopenai_base_url = \"https://relay.example/v1\"\n",
+        ] {
+            assert!(
+                !codex_config_falls_back_to_official_auth_for_third_party(safe),
+                "shape must not be flagged:\n{safe}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_openai_reroute_is_normalized_into_a_custom_table() {
+        let legacy = r#"# keep me
+model = "gpt-5.4"
+model_provider = "openai"
+openai_base_url = "https://relay.example/v1"
+"#;
+        let normalized = normalize_codex_legacy_openai_reroute(legacy)
+            .expect("normalize")
+            .expect("legacy shape must be rewritten");
+
+        assert!(
+            !normalized.contains("openai_base_url"),
+            "the top-level reroute must be removed; got:\n{normalized}"
+        );
+        assert!(
+            normalized.contains("model_provider = \"cc-switch\""),
+            "routing must move to the cc-switch table; got:\n{normalized}"
+        );
+        assert!(
+            normalized.contains("[model_providers.cc-switch]"),
+            "a custom provider table must be created; got:\n{normalized}"
+        );
+        assert!(
+            normalized.contains("base_url = \"https://relay.example/v1\""),
+            "the reroute URL must land in the table; got:\n{normalized}"
+        );
+        assert!(
+            normalized.contains("wire_api = \"responses\""),
+            "the built-in openai provider speaks Responses; got:\n{normalized}"
+        );
+        assert!(
+            normalized.contains("# keep me") && normalized.contains("model = \"gpt-5.4\""),
+            "unrelated content must survive; got:\n{normalized}"
+        );
+
+        // Idempotent: the normalized shape no longer matches.
+        assert!(
+            normalize_codex_legacy_openai_reroute(&normalized)
+                .expect("normalize")
+                .is_none(),
+            "re-running normalization must be a no-op"
+        );
+
+        // The rewritten shape gives the key a provider-scoped slot.
+        let injected =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), &normalized)
+                .expect("prepare live config");
+        assert!(
+            injected.contains("experimental_bearer_token = \"sk-test\""),
+            "token must land inside the cc-switch table; got:\n{injected}"
+        );
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&injected).as_deref(),
+            Some("sk-test"),
+        );
+    }
+
+    #[test]
+    fn legacy_reroute_normalization_covers_unset_and_case_variants_only() {
+        // Unset model_provider defaults to the built-in openai provider.
+        for legacy in [
+            "openai_base_url = \"https://relay.example/v1\"\n",
+            "model_provider = \"OpenAI\"\nopenai_base_url = \"https://relay.example/v1\"\n",
+        ] {
+            assert!(
+                normalize_codex_legacy_openai_reroute(legacy)
+                    .expect("normalize")
+                    .is_some(),
+                "shape must be rewritten:\n{legacy}"
+            );
+        }
+
+        for untouched in [
+            // custom provider: openai_base_url is not what routes it
+            "model_provider = \"custom\"\nopenai_base_url = \"https://relay.example/v1\"\n\n[model_providers.custom]\nbase_url = \"https://aihubmix.example/v1\"\n",
+            // openai_base_url is inert for non-openai built-ins
+            "model_provider = \"ollama\"\nopenai_base_url = \"https://relay.example/v1\"\n",
+            // nothing to rewrite
+            "model_provider = \"openai\"\n",
+            "openai_base_url = \"\"\n",
+        ] {
+            assert!(
+                normalize_codex_legacy_openai_reroute(untouched)
+                    .expect("normalize")
+                    .is_none(),
+                "shape must be left alone:\n{untouched}"
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_runtime_is_a_reserved_provider_id() {
+        // `amazon-bedrock-runtime` is reserved by Codex 0.149; treating it as
+        // custom would inject a token into a table whose `aws` config
+        // hard-conflicts with it. Reserved IDs keep the top-level fallback.
+        assert!(!is_custom_codex_model_provider_id("amazon-bedrock-runtime"));
+
+        let input = r#"model_provider = "amazon-bedrock-runtime"
+"#;
+        let output =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), input)
+                .expect("prepare live config");
+        let parsed: toml::Value = toml::from_str(&output).expect("parse output");
         assert!(
             parsed.get("model_providers").is_none(),
             "reserved provider tables should not be synthesized"
