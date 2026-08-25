@@ -2876,6 +2876,76 @@ fn backfill_codex_custom_provider_names(config_text: &str) -> Result<Option<Stri
     Ok(changed.then(|| doc.to_string()))
 }
 
+/// Codex 0.149 validates EVERY provider table at deserialization — active
+/// or not — and rejects the whole config over field combinations it
+/// forbids: `aws` outside the two Bedrock built-ins, and a command-backed
+/// `auth` combined with `requires_openai_auth` / `env_key` /
+/// `experimental_bearer_token` (ModelProviderInfo::validate). None of these
+/// can be normalized away (dropping user-authored fields is not ours to
+/// do), so the switch path refuses up front with an actionable error
+/// instead of writing a config Codex refuses to start on. Deliberately
+/// called only from plan_codex_live_write: the gate-less paths (proxy
+/// backup/restore) must not fail closed on the user's own backup.
+fn preflight_codex_provider_table_conflicts(config_text: &str) -> Result<(), AppError> {
+    if !config_text.contains("model_providers") {
+        return Ok(());
+    }
+    let Ok(doc) = config_text.parse::<DocumentMut>() else {
+        // Syntactically invalid TOML is rejected later by the write validators.
+        return Ok(());
+    };
+    let Some(model_providers) = doc
+        .get("model_providers")
+        .and_then(|item| item.as_table_like())
+    else {
+        return Ok(());
+    };
+    for (id, item) in model_providers.iter() {
+        let Some(table) = item.as_table_like() else {
+            continue;
+        };
+        let is_bedrock = matches!(id, "amazon-bedrock" | "amazon-bedrock-runtime");
+        if !is_bedrock && table.get("aws").is_some() {
+            return Err(AppError::localized(
+                "provider.codex.config.invalid_provider_table",
+                format!(
+                    "Codex 0.149 拒绝加载该配置：`aws` 字段仅允许用于内置的 amazon-bedrock / amazon-bedrock-runtime，[model_providers.{id}] 不能携带它。请移除该字段或改用 Bedrock 内置 id"
+                ),
+                format!(
+                    "Codex 0.149 refuses to load this config: `aws` is only supported on the built-in amazon-bedrock / amazon-bedrock-runtime providers, so [model_providers.{id}] must not carry it. Remove the field or use a Bedrock built-in id"
+                ),
+            ));
+        }
+        if table.get("auth").is_some() {
+            let requires_openai_auth = table
+                .get("requires_openai_auth")
+                .and_then(|item| item.as_bool())
+                .unwrap_or(false);
+            let conflict = if requires_openai_auth {
+                Some("requires_openai_auth")
+            } else if table.get("env_key").is_some() {
+                Some("env_key")
+            } else if table.get("experimental_bearer_token").is_some() {
+                Some("experimental_bearer_token")
+            } else {
+                None
+            };
+            if let Some(conflict) = conflict {
+                return Err(AppError::localized(
+                    "provider.codex.config.invalid_provider_table",
+                    format!(
+                        "Codex 0.149 拒绝加载该配置：[model_providers.{id}] 的 `auth` 不能与 `{conflict}` 同时存在。请移除其中之一"
+                    ),
+                    format!(
+                        "Codex 0.149 refuses to load this config: `auth` on [model_providers.{id}] cannot be combined with `{conflict}`. Remove one of them"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_codex_legacy_openai_reroute(config_text: &str) -> Result<Option<String>, AppError> {
     if !config_text.contains("openai_base_url") {
         return Ok(None);
@@ -3435,6 +3505,15 @@ fn plan_codex_live_write(
     auth: &Value,
     config_text: Option<&str>,
 ) -> Result<CodexLiveWritePlan, AppError> {
+    // Semantic preflight over EVERY provider table (official and
+    // third-party alike, idle tables included): field combinations 0.149
+    // rejects at load can't be normalized away, so refuse the switch with
+    // an actionable error instead of writing a config Codex won't start on.
+    // Independent of the two auth-safety gates below — those only judge the
+    // active route and are skipped when a key is carried.
+    if let Some(text) = config_text {
+        preflight_codex_provider_table_conflicts(text)?;
+    }
     if category == Some("official") {
         // Official configs seeded by older cc-switch versions can carry
         // stale reserved tables too — Codex refuses those at load, so
@@ -3445,6 +3524,15 @@ fn plan_codex_live_write(
             None => None,
         };
         let config_text = migrated.as_deref().or(config_text);
+        // Official writes never go through prepare_codex_provider_live_config,
+        // so normalize name-less custom tables here too — 0.149 validates
+        // EVERY provider table at load, and an official config can carry
+        // idle leftovers from older cc-switch versions.
+        let named = match config_text {
+            Some(text) => backfill_codex_custom_provider_names(text)?,
+            None => None,
+        };
+        let config_text = named.as_deref().or(config_text);
         let unified_official_config = if crate::settings::unify_codex_session_history() {
             Some(inject_codex_unified_session_bucket(
                 config_text.unwrap_or(""),
@@ -3608,9 +3696,9 @@ pub fn prepare_codex_provider_live_config(
     let migrated = migrate_stale_reserved_provider_tables(config_text, false, token.is_some())?;
     let config_text = migrated.as_deref().unwrap_or(config_text);
 
-    // Also unconditional (covers the keyless and official-write paths):
-    // 0.149 rejects the whole config over any name-less custom table,
-    // active or not.
+    // Also unconditional (covers the keyless third-party path; the official
+    // branch of plan_codex_live_write calls it separately): 0.149 rejects
+    // the whole config over any name-less custom table, active or not.
     let named = backfill_codex_custom_provider_names(config_text)?;
     let config_text = named.as_deref().unwrap_or(config_text);
 
@@ -5342,6 +5430,78 @@ base_url = "https://bedrock.example/v1"
             keyless.contains("name = \"myrelay\"") && keyless.contains("name = \"idle\""),
             "the keyless path must backfill names too; got:\n{keyless}"
         );
+    }
+
+    #[test]
+    fn official_plan_backfills_custom_table_names() {
+        // The official branch of plan_codex_live_write never goes through
+        // prepare_codex_provider_live_config, so it must normalize name-less
+        // custom tables itself — 0.149 validates every table at load, and an
+        // official config can carry idle leftovers from older versions.
+        let config = r#"model = "gpt-5.4"
+
+[model_providers.idle]
+base_url = "https://idle.example/v1"
+
+[model_providers.amazon-bedrock]
+base_url = "https://bedrock.example/v1"
+"#;
+        let plan = plan_codex_live_write(Some("official"), &json!({}), Some(config))
+            .expect("official plan");
+        let written = plan.config_text.expect("official plan carries config");
+        assert!(
+            written.contains("name = \"idle\""),
+            "the official write must backfill idle custom-table names; got:\n{written}"
+        );
+        assert!(
+            !written.contains("name = \"amazon-bedrock\""),
+            "bedrock tables must never receive a name; got:\n{written}"
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_provider_table_conflicts_codex_refuses_to_load() {
+        // 0.149 validates EVERY provider table (idle ones included) and
+        // rejects: aws outside the Bedrock built-ins, and auth combined with
+        // requires_openai_auth / env_key / experimental_bearer_token. These
+        // can't be normalized away, so the switch must refuse up front —
+        // with or without a carried key, official or third-party.
+        let with_key = json!({"OPENAI_API_KEY": "sk-test"});
+        let rejected = [
+            // bare aws on a custom table, no requires_openai_auth anywhere
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://relay.example/v1\"\naws = { region = \"us-east-1\" }\n",
+            // auth × requires_openai_auth — carried key skips the fallback
+            // gate, so the preflight must catch it independently
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nauth = { command = \"my-auth\" }\n",
+            // auth × env_key / experimental_bearer_token
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://relay.example/v1\"\nenv_key = \"MY_KEY\"\nauth = { command = \"my-auth\" }\n",
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://relay.example/v1\"\nexperimental_bearer_token = \"tok\"\nauth = { command = \"my-auth\" }\n",
+            // an IDLE conflicting table poisons the whole config too
+            "model_provider = \"active\"\n\n[model_providers.active]\nname = \"Active\"\nbase_url = \"https://relay.example/v1\"\n\n[model_providers.idle]\nname = \"Idle\"\nbase_url = \"https://idle.example/v1\"\naws = { region = \"us-east-1\" }\n",
+        ] ;
+        for config in rejected {
+            assert!(
+                preflight_codex_live_write(None, &with_key, Some(config)).is_err(),
+                "third-party preflight must refuse:\n{config}"
+            );
+            assert!(
+                preflight_codex_live_write(Some("official"), &json!({}), Some(config)).is_err(),
+                "official preflight must refuse the same shapes:\n{config}"
+            );
+        }
+
+        // Loadable shapes stay accepted: command-backed auth alone, and aws
+        // on the Bedrock built-ins.
+        let accepted = [
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://relay.example/v1\"\nauth = { command = \"my-auth\" }\n",
+            "model_provider = \"amazon-bedrock\"\n\n[model_providers.amazon-bedrock]\nbase_url = \"https://bedrock.example/v1\"\naws = { region = \"us-east-1\" }\n",
+        ];
+        for config in accepted {
+            assert!(
+                preflight_codex_live_write(None, &with_key, Some(config)).is_ok(),
+                "loadable shape must pass the preflight:\n{config}"
+            );
+        }
     }
 
     #[test]
