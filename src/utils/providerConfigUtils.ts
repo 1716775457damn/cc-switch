@@ -606,7 +606,10 @@ const getCodexProviderSectionName = (
 };
 
 const isCustomCodexModelProviderId = (providerName: string): boolean => {
-  const id = providerName.trim().toLowerCase();
+  // Exact match, mirroring upstream Codex and the backend predicate: the
+  // built-in provider lookup is case-sensitive, so "OpenAI" etc. are
+  // legitimate custom ids whose tables carry the bearer token.
+  const id = providerName.trim();
   return Boolean(id) && !CODEX_RESERVED_MODEL_PROVIDER_IDS.has(id);
 };
 

@@ -1048,11 +1048,12 @@ fn active_codex_model_provider_id(doc: &DocumentMut) -> Option<String> {
 }
 
 pub(crate) fn is_custom_codex_model_provider_id(id: &str) -> bool {
+    // Exact match, mirroring upstream: both the built-in provider lookup and
+    // validate_reserved_model_provider_ids are case-sensitive, so `OpenAI`
+    // etc. are legitimate custom ids whose tables must receive the token.
+    // Keep in sync with the frontend list in src/utils/providerConfigUtils.ts.
     let id = id.trim();
-    !id.is_empty()
-        && !CODEX_RESERVED_MODEL_PROVIDER_IDS
-            .iter()
-            .any(|reserved| reserved.eq_ignore_ascii_case(id))
+    !id.is_empty() && !CODEX_RESERVED_MODEL_PROVIDER_IDS.contains(&id)
 }
 
 /// Write only Codex `config.toml` for provider switching.
@@ -2651,7 +2652,7 @@ fn codex_config_falls_back_to_official_auth_for_third_party(config_text: &str) -
                     && table.get("auth").is_none()
                     && table.get("aws").is_none()
             }),
-        Some(id) if id.eq_ignore_ascii_case("openai") => openai_base_url_reroutes(),
+        Some(id) if id == "openai" => openai_base_url_reroutes(),
         None => openai_base_url_reroutes(),
         // Other reserved built-ins (ollama, lmstudio, bedrock…) have their
         // own auth paths and never fall back to the OAuth login.
@@ -2671,9 +2672,6 @@ const CODEX_MIGRATED_PROVIDER_ID: &str = "cc-switch";
 /// so the key needs a provider-scoped slot. The built-in `openai` provider
 /// speaks the Responses wire protocol, so the table pins
 /// `wire_api = "responses"` and traffic semantics stay unchanged. The table
-/// name is deliberately not "OpenAI" — the remote-compaction helpers treat
-/// that display name as a signal. Idempotent: a normalized config keeps no
-/// top-level `openai_base_url`, and an existing `cc-switch` table is ours to
 /// Pick the first free cc-switch-owned provider id (`cc-switch`,
 /// `cc-switch-2`, …) so migrations never overwrite a user-authored table.
 fn first_free_cc_switch_provider_id(model_providers: Option<&dyn toml_edit::TableLike>) -> String {
@@ -2686,28 +2684,39 @@ fn first_free_cc_switch_provider_id(model_providers: Option<&dyn toml_edit::Tabl
     candidate
 }
 
-/// Migrate a stale reserved `[model_providers.openai]` table. Codex rejects
-/// the WHOLE config at load when the reserved built-in id is overridden
-/// (`validate_reserved_model_provider_ids`, present since 0.148), so any
-/// surviving table means "switch reports success, Codex refuses to start" —
-/// older cc-switch takeover projections created exactly that shape.
+/// The reserved built-in ids whose `[model_providers.<id>]` tables make
+/// Codex reject the WHOLE config at load (`validate_reserved_model_provider_ids`,
+/// present since 0.148, case-sensitive; the bedrock ids are exempt).
+const CODEX_STALE_RESERVED_TABLE_IDS: &[&str] = &["openai", "ollama", "lmstudio"];
+
+/// Migrate stale reserved provider tables (`[model_providers.openai]`,
+/// `.ollama`, `.lmstudio`). Codex rejects the WHOLE config at load when one
+/// of these reserved built-in ids is overridden, so any surviving table
+/// means "switch reports success, Codex refuses to start" — older cc-switch
+/// takeover projections created exactly these shapes.
 ///
 /// The reserved-id match is EXACT, mirroring upstream: `OpenAI` and other
-/// case variants are legitimate custom ids and must not be touched. The
+/// case variants are legitimate custom ids and must not be touched. Each
 /// table is renamed losslessly to the first free cc-switch id (nothing
 /// proves which of its keys the user cares about), with
-/// `wire_api = "responses"` defaulted in — the table meant "the OpenAI
-/// provider". The active route is deliberately NOT redirected to the
-/// renamed table and no base_url is lifted anywhere: since 0.148 the shape
-/// never loaded, so there is no working behavior to preserve, and
-/// synthesizing a live route out of an unvalidated stale address would send
-/// whatever auth.json holds to it (the exact leak class the safety gates
-/// exist to prevent). After migration the config routes to the built-in
-/// provider — official traffic to the official endpoint — while the
-/// renamed table keeps every user key for manual recovery. Returns None
-/// when there is nothing to migrate.
-fn migrate_stale_reserved_openai_provider_table(
+/// `wire_api = "responses"` defaulted in — all three built-ins speak
+/// Responses on 0.149.
+///
+/// Route policy: when the renamed table was the active route, follow to the
+/// migrated id ONLY on a third-party write that can actually authenticate
+/// against it — an injectable token exists, or the table carries its own
+/// credentials (env_key / auth / aws / plain Authorization headers per
+/// `codex_provider_table_declares_auth`). Otherwise the route snaps back to
+/// the built-in provider: the shape never loaded since 0.148 so there is no
+/// working behavior to preserve, and pointing a credential-less route at a
+/// stale address would either 401 pointlessly or, worse, let a
+/// `requires_openai_auth` table resolve whatever auth.json holds. Official
+/// writes never follow — an official card's route belongs to the built-in
+/// provider. Returns None when there is nothing to migrate.
+fn migrate_stale_reserved_provider_tables(
     config_text: &str,
+    official: bool,
+    has_token: bool,
 ) -> Result<Option<String>, AppError> {
     if !config_text.contains("model_providers") {
         return Ok(None);
@@ -2716,35 +2725,54 @@ fn migrate_stale_reserved_openai_provider_table(
         .parse::<DocumentMut>()
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
 
-    let has_stale_table = doc
-        .get("model_providers")
-        .and_then(|item| item.as_table_like())
-        .and_then(|table| table.get("openai"))
-        .and_then(|item| item.as_table_like())
-        .is_some();
-    if !has_stale_table {
+    let stale_ids: Vec<&str> = CODEX_STALE_RESERVED_TABLE_IDS
+        .iter()
+        .copied()
+        .filter(|id| {
+            doc.get("model_providers")
+                .and_then(|item| item.as_table_like())
+                .and_then(|table| table.get(id))
+                .and_then(|item| item.as_table_like())
+                .is_some()
+        })
+        .collect();
+    if stale_ids.is_empty() {
         return Ok(None);
     }
 
-    let migrated_id = first_free_cc_switch_provider_id(
-        doc.get("model_providers")
-            .and_then(|item| item.as_table_like()),
-    );
-    let Some(model_providers) = doc
-        .get_mut("model_providers")
-        .and_then(|item| item.as_table_like_mut())
-    else {
-        return Ok(None);
-    };
-    let Some(mut stale_item) = model_providers.remove("openai") else {
-        return Ok(None);
-    };
-    if let Some(table) = stale_item.as_table_like_mut() {
-        if table.get("wire_api").is_none() {
-            table.insert("wire_api", toml_edit::value("responses"));
+    for stale_id in stale_ids {
+        let migrated_id = first_free_cc_switch_provider_id(
+            doc.get("model_providers")
+                .and_then(|item| item.as_table_like()),
+        );
+        // `model_provider` unset defaults to the built-in openai provider.
+        let table_is_active_route = match active_codex_model_provider_id(&doc) {
+            None => stale_id == "openai",
+            Some(active) => active == stale_id,
+        };
+
+        let Some(model_providers) = doc
+            .get_mut("model_providers")
+            .and_then(|item| item.as_table_like_mut())
+        else {
+            return Ok(None);
+        };
+        let Some(mut stale_item) = model_providers.remove(stale_id) else {
+            continue;
+        };
+        let mut declares_own_auth = false;
+        if let Some(table) = stale_item.as_table_like_mut() {
+            if table.get("wire_api").is_none() {
+                table.insert("wire_api", toml_edit::value("responses"));
+            }
+            declares_own_auth = codex_provider_table_declares_auth(&*table);
+        }
+        model_providers.insert(&migrated_id, stale_item);
+
+        if table_is_active_route && !official && (has_token || declares_own_auth) {
+            doc["model_provider"] = toml_edit::value(migrated_id.as_str());
         }
     }
-    model_providers.insert(&migrated_id, stale_item);
 
     Ok(Some(doc.to_string()))
 }
@@ -3309,14 +3337,15 @@ fn plan_codex_live_write(
     config_text: Option<&str>,
 ) -> Result<CodexLiveWritePlan, AppError> {
     if category == Some("official") {
-        // Official configs seeded by older cc-switch versions can carry a
-        // stale [model_providers.openai] table too — 0.149 refuses those at
-        // load, so strip it on every write path, not only third-party.
-        let stripped = match config_text {
-            Some(text) => migrate_stale_reserved_openai_provider_table(text)?,
+        // Official configs seeded by older cc-switch versions can carry
+        // stale reserved tables too — Codex refuses those at load, so
+        // migrate on every write path, not only third-party. Official
+        // context: the route never follows the renamed table.
+        let migrated = match config_text {
+            Some(text) => migrate_stale_reserved_provider_tables(text, true, false)?,
             None => None,
         };
-        let config_text = stripped.as_deref().or(config_text);
+        let config_text = migrated.as_deref().or(config_text);
         let unified_official_config = if crate::settings::unify_codex_session_history() {
             Some(inject_codex_unified_session_bucket(
                 config_text.unwrap_or(""),
@@ -3348,6 +3377,16 @@ fn plan_codex_live_write(
     // text (e.g. `auth = {}` raw-edited providers) — mirror
     // prepare_codex_provider_live_config's token sources.
     let carried_key = extract_codex_api_key(Some(auth), config_text);
+
+    // Stale reserved tables are migrated BEFORE the safety gates so the
+    // gates judge the same text prepare will write (a mixed stale-table +
+    // openai_base_url shape would otherwise be mis-refused). prepare
+    // migrates again internally (idempotent) for the gate-less proxy paths.
+    let migrated = match config_text {
+        Some(text) => migrate_stale_reserved_provider_tables(text, false, carried_key.is_some())?,
+        None => None,
+    };
+    let config_text = migrated.as_deref().or(config_text);
 
     // The legacy reroute shape (built-in `openai` provider + top-level
     // `openai_base_url`) has no provider table to carry the key — rewrite it
@@ -3461,13 +3500,14 @@ pub fn prepare_codex_provider_live_config(
     auth: &Value,
     config_text: &str,
 ) -> Result<String, AppError> {
-    // Unconditional: a stale reserved table makes Codex 0.149 refuse the
-    // whole config, token or not.
-    let stripped = migrate_stale_reserved_openai_provider_table(config_text)?;
-    let config_text = stripped.as_deref().unwrap_or(config_text);
-
     let token = extract_codex_auth_api_key(auth)
         .or_else(|| extract_codex_experimental_bearer_token(config_text));
+
+    // Unconditional: a stale reserved table makes Codex refuse the whole
+    // config (0.148+), token or not. Third-party context — the route may
+    // follow the renamed table when it can authenticate (see the migrator).
+    let migrated = migrate_stale_reserved_provider_tables(config_text, false, token.is_some())?;
+    let config_text = migrated.as_deref().unwrap_or(config_text);
 
     let Some(token) = token else {
         return Ok(config_text.to_string());
@@ -4720,52 +4760,111 @@ http_headers = { x-team = "42" }
     }
 
     #[test]
-    fn stale_reserved_openai_table_is_renamed_losslessly() {
-        // Older cc-switch takeover projections created [model_providers.openai]
-        // when rewriting base_url for the built-in provider; Codex rejects the
-        // whole config at load when a reserved id is overridden (0.148+).
-        // The table is renamed to a cc-switch id keeping every user key, and
-        // the route deliberately snaps back to the built-in provider: the
-        // shape never loaded since 0.148, so promoting its stale address into
-        // a live route would send auth.json credentials to it.
+    fn stale_reserved_tables_are_renamed_with_credential_aware_routing() {
+        // Older cc-switch takeover projections created reserved
+        // [model_providers.openai]/[.ollama]/[.lmstudio] tables; Codex 0.148+
+        // rejects the whole config at load. Tables are renamed losslessly;
+        // the route follows the renamed table only when it can authenticate.
         let stale = r#"model_provider = "openai"
 model = "gpt-5.4"
 
 [model_providers.openai]
 name = "OpenAI"
 base_url = "https://relay.example/v1"
-env_key = "MY_RELAY_KEY"
 http_headers = { x-team = "42" }
 "#;
+
+        // With an injectable key: follow the renamed table and inject into it
+        // — snapping back to the built-in provider would silently bill the
+        // preserved official account (or 401 with preservation off).
         let prepared =
             prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), stale)
                 .expect("prepare live config");
         assert!(
-            !prepared.contains("[model_providers.openai]"),
-            "the reserved table must be renamed away; got:\n{prepared}"
-        );
-        assert!(
-            prepared.contains("[model_providers.cc-switch]")
-                && prepared.contains("base_url = \"https://relay.example/v1\"")
-                && prepared.contains("env_key = \"MY_RELAY_KEY\"")
+            !prepared.contains("[model_providers.openai]")
+                && prepared.contains("[model_providers.cc-switch]")
                 && prepared.contains("x-team")
                 && prepared.contains("wire_api = \"responses\""),
-            "every user key must survive the rename (wire_api defaulted); got:\n{prepared}"
+            "the table must be renamed losslessly (wire_api defaulted); got:\n{prepared}"
         );
         assert!(
-            prepared.contains("model_provider = \"openai\"")
-                && !prepared.contains("openai_base_url"),
-            "the route snaps back to the built-in provider, no synthesized reroute; got:\n{prepared}"
+            prepared.contains("model_provider = \"cc-switch\""),
+            "with a key the route must follow the renamed table; got:\n{prepared}"
+        );
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&prepared).as_deref(),
+            Some("sk-test"),
+            "the key must land in the followed table"
         );
 
-        // Keyless configs must migrate too — the config has to load.
-        let keyless = prepare_codex_provider_live_config(&json!({}), stale)
+        // Keyless but the table carries its own credentials (plain
+        // Authorization header): follow — 0.149 resolves it unauthenticated
+        // and the provider headers survive.
+        let header_auth_stale = r#"model_provider = "openai"
+
+[model_providers.openai]
+base_url = "https://relay.example/v1"
+http_headers = { Authorization = "Bearer own-key" }
+"#;
+        let keyless = prepare_codex_provider_live_config(&json!({}), header_auth_stale)
             .expect("prepare live config without token");
         assert!(
-            !keyless.contains("[model_providers.openai]")
-                && keyless.contains("[model_providers.cc-switch]")
-                && !keyless.contains("openai_base_url"),
-            "keyless configs are migrated the same way; got:\n{keyless}"
+            keyless.contains("model_provider = \"cc-switch\"") && keyless.contains("own-key"),
+            "self-authenticating tables must keep their route; got:\n{keyless}"
+        );
+
+        // Keyless with no usable credentials (requires_openai_auth only):
+        // never follow — the route snaps back to the built-in provider so a
+        // requires_openai_auth fallback cannot resolve auth.json against a
+        // stale third-party address.
+        let fallback_stale = r#"model_provider = "openai"
+
+[model_providers.openai]
+base_url = "https://relay.example/v1"
+requires_openai_auth = true
+"#;
+        let snapped = prepare_codex_provider_live_config(&json!({}), fallback_stale)
+            .expect("prepare live config without token");
+        assert!(
+            snapped.contains("model_provider = \"openai\"")
+                && !snapped.contains("[model_providers.openai]")
+                && snapped.contains("[model_providers.cc-switch]"),
+            "credential-less tables are renamed but the route snaps back; got:\n{snapped}"
+        );
+
+        // Official context never follows, even with credentials in the table.
+        let official = migrate_stale_reserved_provider_tables(header_auth_stale, true, true)
+            .expect("migrate")
+            .expect("stale table must still be renamed");
+        assert!(
+            official.contains("model_provider = \"openai\"")
+                && official.contains("[model_providers.cc-switch]"),
+            "official routes never follow a renamed table; got:\n{official}"
+        );
+
+        // All three reserved ids are migrated; inactive ones never retarget
+        // the route.
+        let multi_stale = r#"model_provider = "third"
+
+[model_providers.third]
+base_url = "https://third.example/v1"
+
+[model_providers.ollama]
+base_url = "http://127.0.0.1:11434/v1"
+
+[model_providers.lmstudio]
+base_url = "http://127.0.0.1:1234/v1"
+"#;
+        let cleaned = migrate_stale_reserved_provider_tables(multi_stale, false, true)
+            .expect("migrate")
+            .expect("stale tables must be renamed");
+        assert!(
+            !cleaned.contains("[model_providers.ollama]")
+                && !cleaned.contains("[model_providers.lmstudio]")
+                && cleaned.contains("[model_providers.cc-switch]")
+                && cleaned.contains("[model_providers.cc-switch-2]")
+                && cleaned.contains("model_provider = \"third\""),
+            "every reserved table is renamed, the active route stays; got:\n{cleaned}"
         );
 
         // Upstream reserved-id validation is case-sensitive: `OpenAI` is a
@@ -4776,37 +4875,61 @@ http_headers = { x-team = "42" }
 base_url = "https://mine.example/v1"
 "#;
         assert!(
-            migrate_stale_reserved_openai_provider_table(custom_case_variant)
+            migrate_stale_reserved_provider_tables(custom_case_variant, false, true)
                 .expect("migrate")
                 .is_none(),
             "case-variant custom ids are not stale residue"
         );
 
-        // A stale table next to an unrelated custom route is renamed without
-        // touching the active route.
-        let custom_route = r#"model_provider = "third"
-
-[model_providers.third]
-base_url = "https://third.example/v1"
-
-[model_providers.openai]
-base_url = "https://relay.example/v1"
-"#;
-        let cleaned = migrate_stale_reserved_openai_provider_table(custom_route)
-            .expect("migrate")
-            .expect("stale table must be renamed");
-        assert!(
-            !cleaned.contains("[model_providers.openai]")
-                && cleaned.contains("[model_providers.cc-switch]")
-                && cleaned.contains("model_provider = \"third\""),
-            "inactive stale tables are renamed, the route stays; got:\n{cleaned}"
-        );
-
         // Nothing to migrate -> no rewrite.
         assert!(
-            migrate_stale_reserved_openai_provider_table("model = \"gpt-5\"\n")
+            migrate_stale_reserved_provider_tables("model = \"gpt-5\"\n", false, true)
                 .expect("migrate")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn case_variant_reserved_ids_are_custom_providers() {
+        // Upstream's built-in lookup and reserved-id validation are both
+        // case-sensitive, so [model_providers.OpenAI] is a legitimate custom
+        // provider — the token must land inside its table, not in a dead
+        // top-level field.
+        let case_variant = r#"model_provider = "OpenAI"
+model = "gpt-5.4"
+
+[model_providers.OpenAI]
+name = "Mine"
+base_url = "https://mine.example/v1"
+wire_api = "responses"
+"#;
+        assert!(is_custom_codex_model_provider_id("OpenAI"));
+        assert!(is_custom_codex_model_provider_id("Ollama"));
+        assert!(!is_custom_codex_model_provider_id("openai"));
+
+        let prepared =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), case_variant)
+                .expect("prepare live config");
+        assert!(
+            prepared.contains("[model_providers.OpenAI]"),
+            "the custom table must survive; got:\n{prepared}"
+        );
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&prepared).as_deref(),
+            Some("sk-test"),
+        );
+        let parsed: toml::Value = toml::from_str(&prepared).expect("parse output");
+        assert!(
+            parsed
+                .get("model_providers")
+                .and_then(|mp| mp.get("OpenAI"))
+                .and_then(|t| t.get("experimental_bearer_token"))
+                .is_some(),
+            "the token must land inside the case-variant custom table; got:\n{prepared}"
+        );
+        assert!(
+            parsed.get("experimental_bearer_token").is_none(),
+            "no dead top-level token; got:\n{prepared}"
         );
     }
 

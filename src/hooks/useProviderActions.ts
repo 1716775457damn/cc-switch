@@ -312,7 +312,7 @@ export function useProviderActions(
             toast.warning(
               t("notifications.codexAuthCleanupFailed", {
                 defaultValue:
-                  "切换成功，但未能删除 auth.json，官方登录凭据仍留在磁盘上；如需彻底移除请手动删除 ~/.codex/auth.json",
+                  "切换成功，但未能删除 auth.json，官方登录凭据仍留在磁盘上；如需彻底移除请手动删除 Codex 配置目录中的 auth.json",
               }),
               { duration: 6000 },
             );
