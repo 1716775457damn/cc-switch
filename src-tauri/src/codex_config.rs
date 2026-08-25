@@ -2680,14 +2680,6 @@ fn codex_config_falls_back_to_official_auth_for_third_party(config_text: &str) -
 /// Not a Codex reserved id, so an injected token lands inside the table.
 const CODEX_MIGRATED_PROVIDER_ID: &str = "cc-switch";
 
-/// Rewrite the legacy "reroute the built-in openai provider" shape —
-/// `model_provider` unset/"openai" plus a top-level `openai_base_url` — into
-/// a custom provider table named `cc-switch`. Before Codex 0.149 this shape
-/// worked because the built-in provider read the third-party key from
-/// auth.json (ambient auth); auth.json no longer carries third-party keys,
-/// so the key needs a provider-scoped slot. The built-in `openai` provider
-/// speaks the Responses wire protocol, so the table pins
-/// `wire_api = "responses"` and traffic semantics stay unchanged. The table
 /// Pick the first free cc-switch-owned provider id (`cc-switch`,
 /// `cc-switch-2`, …) so migrations never overwrite a user-authored table.
 fn first_free_cc_switch_provider_id(model_providers: Option<&dyn toml_edit::TableLike>) -> String {
@@ -2946,6 +2938,14 @@ fn preflight_codex_provider_table_conflicts(config_text: &str) -> Result<(), App
     Ok(())
 }
 
+/// Rewrite the legacy "reroute the built-in openai provider" shape —
+/// `model_provider` unset/"openai" plus a top-level `openai_base_url` — into
+/// a custom provider table named `cc-switch`. Before Codex 0.149 this shape
+/// worked because the built-in provider read the third-party key from
+/// auth.json (ambient auth); auth.json no longer carries third-party keys,
+/// so the key needs a provider-scoped slot. The built-in `openai` provider
+/// speaks the Responses wire protocol, so the table pins
+/// `wire_api = "responses"` and traffic semantics stay unchanged.
 fn normalize_codex_legacy_openai_reroute(config_text: &str) -> Result<Option<String>, AppError> {
     if !config_text.contains("openai_base_url") {
         return Ok(None);
