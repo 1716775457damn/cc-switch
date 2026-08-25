@@ -394,16 +394,17 @@ impl CodexCatalogToolProfile {
 }
 
 /// Reserved built-in provider IDs from OpenAI Codex's config/model-provider
-/// catalog. Keep in sync with Codex `RESERVED_MODEL_PROVIDER_IDS` and legacy
-/// removed provider aliases.
+/// catalog. Keep in sync with Codex `RESERVED_MODEL_PROVIDER_IDS` (0.149:
+/// exactly these five; 0.148 is the same minus `amazon-bedrock-runtime`).
+/// `oss` / `ollama-chat` are NOT reserved on 0.148/0.149 — both load as
+/// ordinary custom tables — so listing them here would strand their bearer
+/// token in the ignored top level. Mirror: providerConfigUtils.ts.
 const CODEX_RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[
     "amazon-bedrock",
     "amazon-bedrock-runtime",
     "openai",
     "ollama",
     "lmstudio",
-    "oss",
-    "ollama-chat",
 ];
 
 /// 获取 Codex 配置目录路径
@@ -2571,6 +2572,26 @@ fn table_declares_authorization_header(item: Option<&toml_edit::Item>) -> bool {
 /// official credentials to the third-party endpoint. The injected token
 /// short-circuits that (the preservation-mode bridge contract); a
 /// contradictory Authorization header loses either way on 0.149.
+/// Whether this provider table resolves its auth from `auth.json` on Codex
+/// 0.149. `resolve_provider_auth` short-circuits on `env_key` /
+/// `experimental_bearer_token`, and an `auth` (command-backed) or `aws`
+/// subtable replaces the auth manager entirely; with none of those,
+/// `requires_openai_auth = false` resolves to the unauthenticated provider —
+/// it never reads `auth.json`, no matter what the table carries (x-api-key
+/// headers, query params, or nothing at all for local servers). Only
+/// `requires_openai_auth = true` without a short-circuit falls through to
+/// the official login.
+fn codex_provider_table_falls_back_to_official_auth(table: &dyn toml_edit::TableLike) -> bool {
+    table
+        .get("requires_openai_auth")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false)
+        && table.get("env_key").is_none()
+        && table.get("experimental_bearer_token").is_none()
+        && table.get("auth").is_none()
+        && table.get("aws").is_none()
+}
+
 fn codex_provider_table_declares_auth(table: &dyn toml_edit::TableLike) -> bool {
     let requires_openai_auth = table
         .get("requires_openai_auth")
@@ -2643,15 +2664,7 @@ fn codex_config_falls_back_to_official_auth_for_third_party(config_text: &str) -
             .and_then(|item| item.as_table_like())
             .and_then(|table| table.get(&id))
             .and_then(|item| item.as_table_like())
-            .is_some_and(|table| {
-                table
-                    .get("requires_openai_auth")
-                    .and_then(|item| item.as_bool())
-                    .unwrap_or(false)
-                    && table.get("env_key").is_none()
-                    && table.get("auth").is_none()
-                    && table.get("aws").is_none()
-            }),
+            .is_some_and(codex_provider_table_falls_back_to_official_auth),
         Some(id) if id == "openai" => openai_base_url_reroutes(),
         None => openai_base_url_reroutes(),
         // Other reserved built-ins (ollama, lmstudio, bedrock…) have their
@@ -2702,17 +2715,23 @@ const CODEX_STALE_RESERVED_TABLE_IDS: &[&str] = &["openai", "ollama", "lmstudio"
 /// `wire_api = "responses"` defaulted in — all three built-ins speak
 /// Responses on 0.149.
 ///
-/// Route policy: when the renamed table was the active route, follow to the
-/// migrated id ONLY on a third-party write that can actually authenticate
-/// against it — an injectable token exists, or the table carries its own
-/// credentials (env_key / auth / aws / plain Authorization headers per
-/// `codex_provider_table_declares_auth`). Otherwise the route snaps back to
-/// the built-in provider: the shape never loaded since 0.148 so there is no
-/// working behavior to preserve, and pointing a credential-less route at a
-/// stale address would either 401 pointlessly or, worse, let a
-/// `requires_openai_auth` table resolve whatever auth.json holds. Official
-/// writes never follow — an official card's route belongs to the built-in
-/// provider. Returns None when there is nothing to migrate.
+/// Route policy: when the renamed table was the active route, a third-party
+/// write follows to the migrated id unless the table would resolve its auth
+/// from auth.json (`codex_provider_table_falls_back_to_official_auth`) with
+/// no injectable token to short-circuit it. Tables that never fall back —
+/// own credentials (env_key / experimental_bearer_token / auth / aws),
+/// header or query-param auth, or unauthenticated local servers — keep
+/// their legitimate route; only a credential-less
+/// `requires_openai_auth = true` table without a token snaps back to the
+/// built-in provider, because following it would send the preserved OAuth
+/// login to a stale address. The renamed table is also normalized into a
+/// shape 0.149 will load: `wire_api` forced to "responses" (the chat wire
+/// API was removed; any other value fails deserialization of the whole
+/// config) and an empty/missing `name` backfilled (rejected at load
+/// otherwise, active or not). The shape never loaded since 0.148, so there
+/// is no prior behavior to preserve. Official writes never follow — an
+/// official card's route belongs to the built-in provider. Returns None
+/// when there is nothing to migrate.
 fn migrate_stale_reserved_provider_tables(
     config_text: &str,
     official: bool,
@@ -2760,16 +2779,40 @@ fn migrate_stale_reserved_provider_tables(
         let Some(mut stale_item) = model_providers.remove(stale_id) else {
             continue;
         };
-        let mut declares_own_auth = false;
+        let mut falls_back_to_official = false;
         if let Some(table) = stale_item.as_table_like_mut() {
-            if table.get("wire_api").is_none() {
+            // 0.149 removed the chat wire API entirely: `wire_api = "chat"`
+            // (or any other non-"responses" value) fails deserialization for
+            // the WHOLE config, so normalize unconditionally. These tables
+            // never loaded since 0.148 — there is no prior behavior to keep.
+            if table.get("wire_api").and_then(|item| item.as_str()) != Some("responses") {
                 table.insert("wire_api", toml_edit::value("responses"));
             }
-            declares_own_auth = codex_provider_table_declares_auth(&*table);
+            // Non-bedrock tables with an empty/missing `name` are rejected at
+            // load ("provider name must not be empty"), active or not — the
+            // legacy update path created name-less tables.
+            if table
+                .get("name")
+                .and_then(|item| item.as_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .is_none()
+            {
+                table.insert("name", toml_edit::value("Custom"));
+            }
+            falls_back_to_official = codex_provider_table_falls_back_to_official_auth(&*table);
         }
         model_providers.insert(&migrated_id, stale_item);
 
-        if table_is_active_route && !official && (has_token || declares_own_auth) {
+        // Follow the rename whenever the table cannot leak the official
+        // login: an injected token short-circuits the auth.json fallback,
+        // and a table that never falls back (own credentials, header/query
+        // auth, or unauthenticated local servers) keeps its legitimate
+        // third-party route. Only a credential-less
+        // `requires_openai_auth = true` table without a token snaps back to
+        // the built-in provider — following it would send the preserved
+        // OAuth login to the stale base_url.
+        if table_is_active_route && !official && (has_token || !falls_back_to_official) {
             doc["model_provider"] = toml_edit::value(migrated_id.as_str());
         }
     }
@@ -3657,6 +3700,19 @@ pub fn update_codex_toml_field(toml_str: &str, field: &str, value: &str) -> Resu
                         .get_mut(&provider_key)
                         .and_then(toml_edit::Item::as_table_like_mut)
                     {
+                        // 0.149 在反序列化时就拒绝 name 为空/缺失的非 bedrock
+                        // 表（"provider name must not be empty"，整份配置拒
+                        // 载）——本函数正是历史上无 name 表的制造源头，建表
+                        // /改表时必须保证 name 非空。
+                        if provider_table
+                            .get("name")
+                            .and_then(|item| item.as_str())
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .is_none()
+                        {
+                            provider_table.insert("name", toml_edit::value(provider_key.as_str()));
+                        }
                         if trimmed.is_empty() {
                             provider_table.remove(field);
                         } else {
@@ -4614,6 +4670,8 @@ http_headers = { Authorization = "Bearer explicit-header-token" }
             "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nhttp_headers = { Authorization = \"Bearer k\" }\n",
             // provider-own credentials outrank / replace the fallback
             "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nenv_key = \"MY_KEY\"\n",
+            // a scoped token is second in the 0.149 short-circuit chain
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nexperimental_bearer_token = \"tok\"\n",
             "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nauth = { type = \"oauth\" }\n",
             "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\naws = { region = \"us-east-1\" }\n",
             // no routing directive at all: stays on the official provider
@@ -4760,11 +4818,12 @@ http_headers = { x-team = "42" }
     }
 
     #[test]
-    fn stale_reserved_tables_are_renamed_with_credential_aware_routing() {
+    fn stale_reserved_tables_are_renamed_with_fallback_aware_routing() {
         // Older cc-switch takeover projections created reserved
         // [model_providers.openai]/[.ollama]/[.lmstudio] tables; Codex 0.148+
-        // rejects the whole config at load. Tables are renamed losslessly;
-        // the route follows the renamed table only when it can authenticate.
+        // rejects the whole config at load. Tables are renamed and made
+        // loadable; the route follows unless the table would resolve
+        // auth.json with no injected token to short-circuit it.
         let stale = r#"model_provider = "openai"
 model = "gpt-5.4"
 
@@ -4799,7 +4858,8 @@ http_headers = { x-team = "42" }
 
         // Keyless but the table carries its own credentials (plain
         // Authorization header): follow — 0.149 resolves it unauthenticated
-        // and the provider headers survive.
+        // and the provider headers survive. The name-less table is also
+        // backfilled so the renamed table loads at all.
         let header_auth_stale = r#"model_provider = "openai"
 
 [model_providers.openai]
@@ -4811,6 +4871,50 @@ http_headers = { Authorization = "Bearer own-key" }
         assert!(
             keyless.contains("model_provider = \"cc-switch\"") && keyless.contains("own-key"),
             "self-authenticating tables must keep their route; got:\n{keyless}"
+        );
+        assert!(
+            keyless.contains("name = \"Custom\""),
+            "a missing name must be backfilled — 0.149 rejects the whole config otherwise; got:\n{keyless}"
+        );
+
+        // Keyless with no credentials at all (requires_openai_auth defaults
+        // to false): follow — 0.149 resolves such a table unauthenticated
+        // and never reads auth.json, so the local/relay route is kept. A
+        // stale `wire_api = "chat"` is normalized: 0.149 removed the chat
+        // wire API and rejects the whole config on any non-"responses"
+        // value.
+        let unauthenticated_stale = r#"model_provider = "openai"
+
+[model_providers.openai]
+name = "Local Ollama"
+base_url = "http://127.0.0.1:11434/v1"
+wire_api = "chat"
+"#;
+        let local = prepare_codex_provider_live_config(&json!({}), unauthenticated_stale)
+            .expect("prepare live config without token");
+        assert!(
+            local.contains("model_provider = \"cc-switch\"")
+                && local.contains("wire_api = \"responses\"")
+                && !local.contains("wire_api = \"chat\""),
+            "unauthenticated tables keep their route and chat wire_api is normalized; got:\n{local}"
+        );
+
+        // Keyless but the table carries its own scoped token: follow —
+        // `experimental_bearer_token` is second in the 0.149 short-circuit
+        // chain, the table authenticates itself.
+        let scoped_token_stale = r#"model_provider = "openai"
+
+[model_providers.openai]
+name = "Relay"
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "own-scoped-token"
+"#;
+        let scoped = prepare_codex_provider_live_config(&json!({}), scoped_token_stale)
+            .expect("prepare live config without token");
+        assert!(
+            scoped.contains("model_provider = \"cc-switch\"")
+                && scoped.contains("own-scoped-token"),
+            "tables with a scoped token must keep their route; got:\n{scoped}"
         );
 
         // Keyless with no usable credentials (requires_openai_auth only):
@@ -4906,6 +5010,33 @@ wire_api = "responses"
         assert!(is_custom_codex_model_provider_id("OpenAI"));
         assert!(is_custom_codex_model_provider_id("Ollama"));
         assert!(!is_custom_codex_model_provider_id("openai"));
+        // `oss` / `ollama-chat` are NOT reserved on 0.148/0.149 — both load
+        // as ordinary custom tables, so the token must reach them too.
+        assert!(is_custom_codex_model_provider_id("oss"));
+        assert!(is_custom_codex_model_provider_id("ollama-chat"));
+
+        let legacy_alias = r#"model_provider = "oss"
+
+[model_providers.oss]
+name = "My OSS Relay"
+base_url = "https://oss.example/v1"
+"#;
+        let alias_prepared =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-oss"}), legacy_alias)
+                .expect("prepare live config");
+        let alias_parsed: toml::Value = toml::from_str(&alias_prepared).expect("parse output");
+        assert!(
+            alias_parsed
+                .get("model_providers")
+                .and_then(|mp| mp.get("oss"))
+                .and_then(|t| t.get("experimental_bearer_token"))
+                .is_some(),
+            "the token must land inside the oss custom table; got:\n{alias_prepared}"
+        );
+        assert!(
+            alias_parsed.get("experimental_bearer_token").is_none(),
+            "no dead top-level token for legacy-alias ids; got:\n{alias_prepared}"
+        );
 
         let prepared =
             prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), case_variant)
@@ -4993,6 +5124,50 @@ model_providers = { mine = { name = "Mine", base_url = "https://mine.example/v1"
         assert!(
             output.contains("[model_providers.Ollama]"),
             "case variants take the custom table path; got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn update_toml_field_backfills_provider_name() {
+        // 0.149 rejects the whole config when any non-bedrock provider table
+        // has an empty/missing `name` — and this function historically
+        // created exactly such tables. Creating or touching a table must
+        // leave it loadable.
+        let created = update_codex_toml_field(
+            "model_provider = \"myrelay\"\n",
+            "base_url",
+            "https://relay.example/v1",
+        )
+        .expect("update");
+        assert!(
+            created.contains("name = \"myrelay\""),
+            "a newly created table must get a non-empty name; got:\n{created}"
+        );
+
+        let existing_nameless = r#"model_provider = "myrelay"
+
+[model_providers.myrelay]
+base_url = "https://old.example/v1"
+"#;
+        let touched =
+            update_codex_toml_field(existing_nameless, "base_url", "https://new.example/v1")
+                .expect("update");
+        assert!(
+            touched.contains("name = \"myrelay\""),
+            "touching a name-less table must backfill the name; got:\n{touched}"
+        );
+
+        let existing_named = r#"model_provider = "myrelay"
+
+[model_providers.myrelay]
+name = "My Relay"
+base_url = "https://old.example/v1"
+"#;
+        let kept = update_codex_toml_field(existing_named, "base_url", "https://new.example/v1")
+            .expect("update");
+        assert!(
+            kept.contains("name = \"My Relay\"") && !kept.contains("name = \"myrelay\""),
+            "an existing name must never be overwritten; got:\n{kept}"
         );
     }
 

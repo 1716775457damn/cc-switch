@@ -465,8 +465,6 @@ const CODEX_RESERVED_MODEL_PROVIDER_IDS = new Set([
   "openai",
   "ollama",
   "lmstudio",
-  "oss",
-  "ollama-chat",
 ]);
 
 interface TomlSectionRange {
@@ -593,9 +591,10 @@ export const hasExplicitNonOpenAiCodexModelProvider = (
   if (typeof configText !== "string") return false;
   if (isCodexUnifiedSessionProjection(configText)) return false;
   const providerName = getCodexModelProviderName(configText);
-  return Boolean(
-    providerName && providerName.trim().toLowerCase() !== "openai",
-  );
+  // Exact match, mirroring the backend: Codex's built-in lookup is
+  // case-sensitive, so `OpenAI` routes to a custom table — a third-party
+  // upstream, not the official provider.
+  return Boolean(providerName && providerName.trim() !== "openai");
 };
 
 const getCodexProviderSectionName = (
