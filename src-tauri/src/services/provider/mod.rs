@@ -5376,6 +5376,23 @@ impl ProviderService {
                 Err(e) => log::warn!("Failed to clean stale Codex auth.json: {e}"),
             }
         }
+        // Third-party dual of the block above: with preservation off, the
+        // config-only write is expected to delete auth.json. A deletion
+        // failure (read-only dir, ACL, file lock) must not fail the switch —
+        // config and current are already committed — but the user has to see
+        // that the official login is still on disk, so surface it as a
+        // switch warning instead of only a log line.
+        if matches!(app_type, AppType::Codex)
+            && provider.category.as_deref() != Some("official")
+            && !crate::proxy::providers::is_codex_official_provider(provider)
+            && !crate::settings::preserve_codex_official_auth_on_switch()
+            && crate::codex_config::get_codex_auth_path().exists()
+        {
+            log::warn!("Codex auth.json still present after a preservation-off third-party switch");
+            result
+                .warnings
+                .push("codex_auth_cleanup_failed".to_string());
+        }
         // Hermes is additive, so "switching" doesn't overwrite a live config file
         // — we instead update the top-level `model:` section to point at this
         // provider's first declared model. Without this, clicking "switch" would
