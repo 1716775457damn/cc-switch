@@ -1109,11 +1109,32 @@ requires_openai_auth = true
 http_headers = { Authorization = "Bearer explicit-header-token" }
 "#;
 
+    let good_config = r#"model_provider = "good"
+model = "gpt-5.4"
+
+[model_providers.good]
+name = "Good"
+base_url = "https://good.example/v1"
+wire_api = "responses"
+"#;
+
     let mut initial_config = MultiAppConfig::default();
     {
         let manager = initial_config
             .get_manager_mut(&AppType::Codex)
             .expect("codex manager");
+        manager.providers.insert(
+            "good".to_string(),
+            Provider::with_id(
+                "good".to_string(),
+                "Good".to_string(),
+                json!({
+                    "auth": {"OPENAI_API_KEY": "sk-good"},
+                    "config": good_config
+                }),
+                None,
+            ),
+        );
         manager.providers.insert(
             "header-auth".to_string(),
             Provider::with_id(
@@ -1130,8 +1151,23 @@ http_headers = { Authorization = "Bearer explicit-header-token" }
 
     let state = create_test_state_with_config(&initial_config).expect("create test state");
 
+    ProviderService::switch(&state, AppType::Codex, "good").expect("switch to the good provider");
+
     ProviderService::switch(&state, AppType::Codex, "header-auth").expect_err(
         "preservation-on switch must fail when a keyless config falls back to the official auth",
+    );
+
+    // The refusal happens in the pre-commit preflight: current must not move,
+    // otherwise the next switch would backfill the good provider's live
+    // config into the refused card's DB row.
+    let current = state
+        .db
+        .get_current_provider(AppType::Codex.as_str())
+        .expect("read current provider");
+    assert_eq!(
+        current.as_deref(),
+        Some("good"),
+        "a refused switch must leave current on the previous provider"
     );
 }
 

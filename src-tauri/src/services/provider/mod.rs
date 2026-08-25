@@ -5327,6 +5327,15 @@ impl ProviderService {
                 ));
             }
         } else {
+            // Codex: validate the live projection before committing current —
+            // the write-layer safety gates can refuse the switch, and a
+            // refusal after current moved would let the next switch backfill
+            // the old live config into the new provider's DB row. (The
+            // managed branch above has its own snapshot rollback instead.)
+            if matches!(app_type, AppType::Codex) && preflighted_provider.is_none() {
+                live::preflight_codex_live_write_for_state(state, provider)?;
+            }
+
             // Additive mode apps skip setting is_current (no such concept).
             if !app_type.is_additive_mode() {
                 crate::settings::set_current_provider(&app_type, Some(id))?;

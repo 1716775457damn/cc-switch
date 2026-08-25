@@ -2705,6 +2705,16 @@ fn normalize_codex_legacy_openai_reroute(config_text: &str) -> Result<Option<Str
         if item.as_table().is_none() {
             return Ok(None);
         }
+        // A user-authored table already claims our id: nothing proves it is
+        // ours to overwrite (their headers/query params would be lost and
+        // later backfilled into the DB for good). Leave the shape to the
+        // safety gates, which refuse it with an actionable error.
+        if item
+            .as_table()
+            .is_some_and(|table| table.contains_key(CODEX_MIGRATED_PROVIDER_ID))
+        {
+            return Ok(None);
+        }
     }
 
     doc.as_table_mut().remove("openai_base_url");
@@ -3188,11 +3198,23 @@ pub fn strip_codex_mcp_servers_from_settings(settings: &mut Value) -> Result<(),
 ///
 /// 统一会话开关开启时，官方配置在落盘前注入共享的 `custom` 路由
 /// （见 `inject_codex_unified_session_bucket`）。
-pub fn write_codex_live_for_provider(
+/// A computed Codex live write. All validation (legacy-shape normalization,
+/// safety gates, token injection, TOML parsing) happens while building the
+/// plan, so callers can preflight a switch — build and discard — before
+/// committing any state, then execute the same computation for the real
+/// write. Keeping validation and execution in one builder makes it
+/// impossible for the two to drift apart.
+struct CodexLiveWritePlan {
+    write_full_auth: bool,
+    config_text: Option<String>,
+    remove_auth_file: bool,
+}
+
+fn plan_codex_live_write(
     category: Option<&str>,
     auth: &Value,
     config_text: Option<&str>,
-) -> Result<(), AppError> {
+) -> Result<CodexLiveWritePlan, AppError> {
     if category == Some("official") {
         let unified_official_config = if crate::settings::unify_codex_session_history() {
             Some(inject_codex_unified_session_bucket(
@@ -3205,11 +3227,11 @@ pub fn write_codex_live_for_provider(
         // Official cards own auth.json: a material-carrying login is written
         // in full, a material-less card follows the live login and only
         // writes config. Official auth never travels through config.toml.
-        return if codex_auth_has_login_material(auth) {
-            write_codex_live_atomic(auth, config_text)
-        } else {
-            write_codex_live_config_atomic(config_text)
-        };
+        return Ok(CodexLiveWritePlan {
+            write_full_auth: codex_auth_has_login_material(auth),
+            config_text: config_text.map(str::to_string),
+            remove_auth_file: false,
+        });
     }
 
     // Third-party switches are config-only. Since Codex 0.149
@@ -3229,13 +3251,22 @@ pub fn write_codex_live_for_provider(
     // The legacy reroute shape (built-in `openai` provider + top-level
     // `openai_base_url`) has no provider table to carry the key — rewrite it
     // into a cc-switch-owned custom table before the safety gates run.
+    // prepare_codex_provider_live_config normalizes again internally
+    // (idempotent); the gates need the normalized text here.
     let normalized = match config_text {
         Some(text) if carried_key.is_some() => normalize_codex_legacy_openai_reroute(text)?,
         _ => None,
     };
     let config_text = normalized.as_deref().or(config_text);
 
-    match config_text {
+    // The preservation setting now means exactly one thing: does the
+    // official login in auth.json survive a third-party switch? Off means
+    // the file is deleted — a lingering login next to a third-party route is
+    // the leak shape the gates exist to prevent, and `{}` is not logout, the
+    // file must go (see clear_stale_codex_live_auth_after_official_switch).
+    let remove_auth_file = !crate::settings::preserve_codex_official_auth_on_switch();
+
+    let live_config = match config_text {
         Some(text) if !text.trim().is_empty() => {
             // Both safety gates protect the same invariant: the auth Codex
             // resolves for a third-party route must never come from
@@ -3257,26 +3288,46 @@ pub fn write_codex_live_for_provider(
                     "This Codex config has no usable API key, and requires_openai_auth = true (or a top-level openai_base_url) would make Codex fall back to whatever login auth.json holds for a third-party route. Add an API key to the provider or remove the fallback directive",
                 ));
             }
-            let live_config = prepare_codex_provider_live_config(auth, text)?;
-            write_codex_live_config_atomic(Some(&live_config))?;
+            prepare_codex_provider_live_config(auth, text)?
         }
-        other => {
-            // Empty config: with a key to carry this errs inside
-            // set_codex_experimental_bearer_token (no table to attach it
-            // to); without a key the empty config is written as-is.
-            let live_config = prepare_codex_provider_live_config(auth, other.unwrap_or(""))?;
-            write_codex_live_config_atomic(Some(&live_config))?;
-        }
-    }
+        // Empty config: with a key to carry this errs inside
+        // set_codex_experimental_bearer_token (no table to attach it to);
+        // without a key the empty config is passed through as-is.
+        other => prepare_codex_provider_live_config(auth, other.unwrap_or(""))?,
+    };
 
-    // The preservation setting now means exactly one thing: does the
-    // official login in auth.json survive a third-party switch? Off means
-    // the file is deleted — a lingering login next to a third-party route is
-    // the leak shape the gates exist to prevent, and `{}` is not logout, the
-    // file must go (see clear_stale_codex_live_auth_after_official_switch).
+    Ok(CodexLiveWritePlan {
+        write_full_auth: false,
+        config_text: Some(live_config),
+        remove_auth_file,
+    })
+}
+
+/// Validate a Codex live write without touching the filesystem. Callers use
+/// this to fail a provider switch BEFORE committing `current`: a write-layer
+/// refusal after `current` moved would let the next switch backfill the old
+/// live config into the new provider's DB row.
+pub fn preflight_codex_live_write(
+    category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+) -> Result<(), AppError> {
+    plan_codex_live_write(category, auth, config_text).map(|_| ())
+}
+
+pub fn write_codex_live_for_provider(
+    category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+) -> Result<(), AppError> {
+    let plan = plan_codex_live_write(category, auth, config_text)?;
+    if plan.write_full_auth {
+        return write_codex_live_atomic(auth, plan.config_text.as_deref());
+    }
+    write_codex_live_config_atomic(plan.config_text.as_deref())?;
     // Config is already committed at this point, so a cleanup failure
     // degrades to a warning instead of reporting an unswitched state.
-    if !crate::settings::preserve_codex_official_auth_on_switch() {
+    if plan.remove_auth_file {
         remove_codex_live_auth_after_third_party_switch();
     }
     Ok(())
@@ -3298,6 +3349,13 @@ fn remove_codex_live_auth_after_third_party_switch() {
 /// requests can use a provider-scoped `experimental_bearer_token`, so switching
 /// providers only needs to update `config.toml`; `auth.json` stays as the user's
 /// long-lived ChatGPT login cache.
+///
+/// This is the single normalize→inject entry point: every caller — provider
+/// switches, takeover backup rebuilds (`preserve_codex_auth_in_backup`), and
+/// restore (`preserve_codex_oauth_login_on_restore`) — gets the legacy
+/// reroute migration, so a pre-0.149 `openai_base_url` shape can never leave
+/// its key in a top-level field Codex ignores while auth.json credentials
+/// stay live. Idempotent on already-normalized text.
 pub fn prepare_codex_provider_live_config(
     auth: &Value,
     config_text: &str,
@@ -3305,10 +3363,12 @@ pub fn prepare_codex_provider_live_config(
     let token = extract_codex_auth_api_key(auth)
         .or_else(|| extract_codex_experimental_bearer_token(config_text));
 
-    Ok(match token {
-        Some(token) => set_codex_experimental_bearer_token(config_text, &token)?,
-        None => config_text.to_string(),
-    })
+    let Some(token) = token else {
+        return Ok(config_text.to_string());
+    };
+    let normalized = normalize_codex_legacy_openai_reroute(config_text)?;
+    let config_text = normalized.as_deref().unwrap_or(config_text);
+    set_codex_experimental_bearer_token(config_text, &token)
 }
 
 /// During DB backfill, lift a live `experimental_bearer_token` back into
@@ -3389,6 +3449,23 @@ pub fn update_codex_toml_field(toml_str: &str, field: &str, value: &str) -> Resu
                 .map(str::to_string);
 
             if let Some(provider_key) = model_provider {
+                // 0.149 的 validate_reserved_model_provider_ids 对配置里出现
+                // `[model_providers.openai]` 等保留 id 表整份报错（"Built-in
+                // providers cannot be overridden"），Codex 直接起不来。内置
+                // openai 的改址走它的正统机制——顶层 `openai_base_url`；
+                // wire_api 由 CLI 内置固定，无需写。其他保留 id（ollama 等）
+                // 没有等价旋钮，维持既有行为不在此扩大改动。
+                if provider_key.eq_ignore_ascii_case("openai") {
+                    if field == "base_url" {
+                        if trimmed.is_empty() {
+                            doc.as_table_mut().remove("openai_base_url");
+                        } else {
+                            doc["openai_base_url"] = toml_edit::value(trimmed);
+                        }
+                    }
+                    return Ok(doc.to_string());
+                }
+
                 // Ensure [model_providers] table exists
                 //
                 // 用 as_table_like_mut 而非 as_table_mut：用户把配置写成 inline table
@@ -4489,6 +4566,87 @@ openai_base_url = "https://relay.example/v1"
                 "shape must be left alone:\n{untouched}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_reroute_normalization_never_overwrites_a_user_cc_switch_table() {
+        // A user-authored [model_providers.cc-switch] proves nothing about
+        // ownership — overwriting it would drop their headers/query params
+        // and backfill the loss into the DB. The shape is left to the safety
+        // gates instead.
+        let conflicted = r#"model_provider = "openai"
+openai_base_url = "https://relay.example/v1"
+
+[model_providers.cc-switch]
+name = "Mine"
+base_url = "https://mine.example/v1"
+http_headers = { x-team = "42" }
+"#;
+        assert!(
+            normalize_codex_legacy_openai_reroute(conflicted)
+                .expect("normalize")
+                .is_none(),
+            "an existing cc-switch table must never be overwritten"
+        );
+        // The gate then refuses the shape with an actionable error.
+        assert!(codex_config_routes_third_party_without_token_slot(
+            conflicted
+        ));
+    }
+
+    #[test]
+    fn prepare_normalizes_legacy_reroute_for_every_caller() {
+        // prepare_codex_provider_live_config is the single normalize→inject
+        // entry point — takeover backup rebuilds and restore call it directly,
+        // so the legacy shape must be migrated here, not only in the switch
+        // path's plan.
+        let legacy = r#"model_provider = "openai"
+model = "gpt-5.4"
+openai_base_url = "https://relay.example/v1"
+"#;
+        let prepared =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), legacy)
+                .expect("prepare live config");
+        assert!(
+            !prepared.contains("openai_base_url")
+                && prepared.contains("[model_providers.cc-switch]"),
+            "prepare must rewrite the legacy reroute shape; got:\n{prepared}"
+        );
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&prepared).as_deref(),
+            Some("sk-test"),
+            "the key must land in the rewritten provider table"
+        );
+        // No token → nothing to protect, the shape passes through untouched.
+        let untouched = prepare_codex_provider_live_config(&json!({}), legacy)
+            .expect("prepare live config without token");
+        assert_eq!(untouched, legacy);
+    }
+
+    #[test]
+    fn update_toml_field_reroutes_built_in_openai_via_top_level_knob() {
+        // Codex 0.149 refuses any [model_providers.openai] table outright
+        // (validate_reserved_model_provider_ids), so rewriting base_url for
+        // the built-in provider must use the top-level openai_base_url knob.
+        let input = "model_provider = \"openai\"\nmodel = \"gpt-5.4\"\n";
+        let output = update_codex_toml_field(input, "base_url", "http://127.0.0.1:5000/v1")
+            .expect("update base_url");
+        assert!(
+            !output.contains("[model_providers.openai]") && !output.contains("model_providers"),
+            "no reserved provider table may be created; got:\n{output}"
+        );
+        assert!(
+            output.contains("openai_base_url = \"http://127.0.0.1:5000/v1\""),
+            "the reroute must use the top-level knob; got:\n{output}"
+        );
+
+        // Clearing the value removes the knob again.
+        let cleared = update_codex_toml_field(&output, "base_url", "").expect("clear base_url");
+        assert!(!cleared.contains("openai_base_url"));
+
+        // wire_api is fixed by the CLI for built-ins — a no-op, not a table.
+        let wire = update_codex_toml_field(input, "wire_api", "responses").expect("set wire_api");
+        assert!(!wire.contains("model_providers"));
     }
 
     #[test]
