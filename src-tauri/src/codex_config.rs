@@ -2555,6 +2555,30 @@ fn table_declares_authorization_header(item: Option<&toml_edit::Item>) -> bool {
         })
 }
 
+/// Whether this provider table resolves its auth from `auth.json` on Codex
+/// 0.149. `resolve_provider_auth` short-circuits on `env_key` /
+/// `experimental_bearer_token`; with neither,
+/// `requires_openai_auth = false` resolves to the unauthenticated provider —
+/// it never reads `auth.json`, no matter what the table carries (x-api-key
+/// headers, query params, or nothing at all for local servers). Only
+/// `requires_openai_auth = true` without a short-circuit falls through to
+/// the official login.
+///
+/// `auth` / `aws` are deliberately NOT short-circuits here: 0.149 validates
+/// both as mutually exclusive with `requires_openai_auth` (and `aws` is
+/// Bedrock-only anyway), so a `requires_openai_auth = true` table carrying
+/// them is a dead config the whole file fails to load with. Treating them
+/// as "own credentials" would wave that dead config through the safety
+/// gate; flagging it keeps it from being written.
+fn codex_provider_table_falls_back_to_official_auth(table: &dyn toml_edit::TableLike) -> bool {
+    table
+        .get("requires_openai_auth")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false)
+        && table.get("env_key").is_none()
+        && table.get("experimental_bearer_token").is_none()
+}
+
 /// Codex 0.149 guard: a provider table that already declares its own
 /// credential source must not receive an injected bearer token. `auth` /
 /// `aws` sub-tables hard-conflict with `experimental_bearer_token` at
@@ -2572,26 +2596,6 @@ fn table_declares_authorization_header(item: Option<&toml_edit::Item>) -> bool {
 /// official credentials to the third-party endpoint. The injected token
 /// short-circuits that (the preservation-mode bridge contract); a
 /// contradictory Authorization header loses either way on 0.149.
-/// Whether this provider table resolves its auth from `auth.json` on Codex
-/// 0.149. `resolve_provider_auth` short-circuits on `env_key` /
-/// `experimental_bearer_token`, and an `auth` (command-backed) or `aws`
-/// subtable replaces the auth manager entirely; with none of those,
-/// `requires_openai_auth = false` resolves to the unauthenticated provider —
-/// it never reads `auth.json`, no matter what the table carries (x-api-key
-/// headers, query params, or nothing at all for local servers). Only
-/// `requires_openai_auth = true` without a short-circuit falls through to
-/// the official login.
-fn codex_provider_table_falls_back_to_official_auth(table: &dyn toml_edit::TableLike) -> bool {
-    table
-        .get("requires_openai_auth")
-        .and_then(|item| item.as_bool())
-        .unwrap_or(false)
-        && table.get("env_key").is_none()
-        && table.get("experimental_bearer_token").is_none()
-        && table.get("auth").is_none()
-        && table.get("aws").is_none()
-}
-
 fn codex_provider_table_declares_auth(table: &dyn toml_edit::TableLike) -> bool {
     let requires_openai_auth = table
         .get("requires_openai_auth")
@@ -2636,9 +2640,8 @@ fn codex_config_routes_third_party_without_token_slot(config_text: &str) -> bool
 
 /// Whether a config with NO injectable API key still routes third-party
 /// traffic through the `auth.json` fallback. On 0.149 a custom provider
-/// with `requires_openai_auth = true` and no credentials of its own
-/// (`env_key` errs hard before the fallback; an `auth`/`aws` subtable
-/// replaces the auth manager entirely) resolves to whatever `auth.json`
+/// with `requires_openai_auth = true` and no `env_key` /
+/// `experimental_bearer_token` short-circuit resolves to whatever `auth.json`
 /// holds — under login preservation that is the official OAuth login,
 /// applied after provider headers, so even an explicit
 /// `http_headers.Authorization` is overwritten and the ChatGPT access
@@ -2719,7 +2722,7 @@ const CODEX_STALE_RESERVED_TABLE_IDS: &[&str] = &["openai", "ollama", "lmstudio"
 /// write follows to the migrated id unless the table would resolve its auth
 /// from auth.json (`codex_provider_table_falls_back_to_official_auth`) with
 /// no injectable token to short-circuit it. Tables that never fall back —
-/// own credentials (env_key / experimental_bearer_token / auth / aws),
+/// own credentials (env_key / experimental_bearer_token),
 /// header or query-param auth, or unauthenticated local servers — keep
 /// their legitimate route; only a credential-less
 /// `requires_openai_auth = true` table without a token snaps back to the
@@ -2818,6 +2821,59 @@ fn migrate_stale_reserved_provider_tables(
     }
 
     Ok(Some(doc.to_string()))
+}
+
+/// Codex 0.149 rejects the WHOLE config at deserialization when any
+/// non-Bedrock provider table has an empty/missing `name` — active or not
+/// ("provider name must not be empty"). Historic cc-switch updates and
+/// hand-written configs created tables carrying only `base_url`, so every
+/// live write normalizes custom tables into a loadable shape; the name is
+/// cosmetic, so the table id is as good a value as any. Bedrock tables are
+/// the opposite: 0.149 only lets them override
+/// base_url/auth/http_headers/aws.*, and any other non-default field —
+/// `name` included — fails the built-in merge for the whole config, so the
+/// reserved ids are skipped entirely.
+fn backfill_codex_custom_provider_names(config_text: &str) -> Result<Option<String>, AppError> {
+    if !config_text.contains("model_providers") {
+        return Ok(None);
+    }
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let Some(model_providers) = doc
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return Ok(None);
+    };
+
+    let ids: Vec<String> = model_providers
+        .iter()
+        .filter(|(id, item)| {
+            is_custom_codex_model_provider_id(id) && item.as_table_like().is_some()
+        })
+        .map(|(id, _)| id.to_string())
+        .collect();
+    let mut changed = false;
+    for id in ids {
+        let Some(table) = model_providers
+            .get_mut(&id)
+            .and_then(toml_edit::Item::as_table_like_mut)
+        else {
+            continue;
+        };
+        if table
+            .get("name")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .is_none()
+        {
+            table.insert("name", toml_edit::value(id.as_str()));
+            changed = true;
+        }
+    }
+    Ok(changed.then(|| doc.to_string()))
 }
 
 fn normalize_codex_legacy_openai_reroute(config_text: &str) -> Result<Option<String>, AppError> {
@@ -3552,6 +3608,12 @@ pub fn prepare_codex_provider_live_config(
     let migrated = migrate_stale_reserved_provider_tables(config_text, false, token.is_some())?;
     let config_text = migrated.as_deref().unwrap_or(config_text);
 
+    // Also unconditional (covers the keyless and official-write paths):
+    // 0.149 rejects the whole config over any name-less custom table,
+    // active or not.
+    let named = backfill_codex_custom_provider_names(config_text)?;
+    let config_text = named.as_deref().unwrap_or(config_text);
+
     let Some(token) = token else {
         return Ok(config_text.to_string());
     };
@@ -3703,13 +3765,17 @@ pub fn update_codex_toml_field(toml_str: &str, field: &str, value: &str) -> Resu
                         // 0.149 在反序列化时就拒绝 name 为空/缺失的非 bedrock
                         // 表（"provider name must not be empty"，整份配置拒
                         // 载）——本函数正是历史上无 name 表的制造源头，建表
-                        // /改表时必须保证 name 非空。
-                        if provider_table
-                            .get("name")
-                            .and_then(|item| item.as_str())
-                            .map(str::trim)
-                            .filter(|name| !name.is_empty())
-                            .is_none()
+                        // /改表时必须保证 name 非空。反向豁免 bedrock 两个保留
+                        // id（此分支唯一能到达的保留 id）：0.149 只允许它们覆盖
+                        // base_url/auth/http_headers/aws.*，写入 name 会让内置
+                        // 合并校验拒绝整份配置——代理接管改 base_url 正走此路。
+                        if is_custom_codex_model_provider_id(&provider_key)
+                            && provider_table
+                                .get("name")
+                                .and_then(|item| item.as_str())
+                                .map(str::trim)
+                                .filter(|name| !name.is_empty())
+                                .is_none()
                         {
                             provider_table.insert("name", toml_edit::value(provider_key.as_str()));
                         }
@@ -4657,6 +4723,12 @@ http_headers = { Authorization = "Bearer explicit-header-token" }
             // built-in openai rerouted to a third party
             "openai_base_url = \"https://relay.example/v1\"\n",
             "model_provider = \"openai\"\nopenai_base_url = \"https://relay.example/v1\"\n",
+            // auth/aws are NOT own-credential short-circuits: 0.149 rejects
+            // both as mutually exclusive with requires_openai_auth (aws is
+            // Bedrock-only on top), so these are dead configs the whole file
+            // fails to load with — flag them instead of writing them out
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nauth = { command = \"my-auth\" }\n",
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\naws = { region = \"us-east-1\" }\n",
         ] {
             assert!(
                 codex_config_falls_back_to_official_auth_for_third_party(dangerous),
@@ -4672,8 +4744,11 @@ http_headers = { Authorization = "Bearer explicit-header-token" }
             "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nenv_key = \"MY_KEY\"\n",
             // a scoped token is second in the 0.149 short-circuit chain
             "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nexperimental_bearer_token = \"tok\"\n",
-            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\nauth = { type = \"oauth\" }\n",
-            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nrequires_openai_auth = true\naws = { region = \"us-east-1\" }\n",
+            // auth/aws without the fallback flag are loadable own-credential
+            // shapes (command-backed auth; aws on its Bedrock-only ids never
+            // reaches this custom-table arm) — requires_openai_auth unset
+            // means no auth.json fallback either way
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\nauth = { command = \"my-auth\" }\n",
             // no routing directive at all: stays on the official provider
             "model = \"gpt-5\"\n",
             "[mcp_servers.echo]\ncommand = \"echo\"\n",
@@ -5172,6 +5247,35 @@ base_url = "https://old.example/v1"
     }
 
     #[test]
+    fn update_toml_field_leaves_bedrock_tables_nameless() {
+        // 0.149 lets the Bedrock built-ins override only
+        // base_url/auth/http_headers/aws.*; any other non-default field —
+        // `name` included — fails the built-in merge for the whole config.
+        // The proxy takeover rewrites base_url + wire_api through this
+        // function, so the name backfill must skip both reserved ids.
+        // (wire_api survives because "responses" is the only value 0.149
+        // deserializes, which equals the default.)
+        for id in ["amazon-bedrock", "amazon-bedrock-runtime"] {
+            let input = format!(
+                "model_provider = \"{id}\"\n\n[model_providers.{id}]\nbase_url = \"https://bedrock.example/v1\"\n"
+            );
+            let rerouted = update_codex_toml_field(&input, "base_url", "http://127.0.0.1:5000/v1")
+                .expect("update base_url");
+            let rerouted = update_codex_toml_field(&rerouted, "wire_api", "responses")
+                .expect("update wire_api");
+            assert!(
+                rerouted.contains("base_url = \"http://127.0.0.1:5000/v1\"")
+                    && rerouted.contains("wire_api = \"responses\""),
+                "the takeover overrides must land in the table; got:\n{rerouted}"
+            );
+            assert!(
+                !rerouted.contains("name ="),
+                "bedrock tables must never receive a name; got:\n{rerouted}"
+            );
+        }
+    }
+
+    #[test]
     fn prepare_normalizes_legacy_reroute_for_every_caller() {
         // prepare_codex_provider_live_config is the single normalize→inject
         // entry point — takeover backup rebuilds and restore call it directly,
@@ -5198,6 +5302,46 @@ openai_base_url = "https://relay.example/v1"
         let untouched = prepare_codex_provider_live_config(&json!({}), legacy)
             .expect("prepare live config without token");
         assert_eq!(untouched, legacy);
+    }
+
+    #[test]
+    fn prepare_backfills_names_on_plain_custom_tables() {
+        // 0.149 rejects the whole config over any name-less custom table,
+        // active or not — plain config-only switches never go through the
+        // update path, so prepare itself must normalize. Bedrock tables are
+        // the mirror image: adding `name` there fails the built-in merge,
+        // so the reserved ids must stay untouched.
+        let config = r#"model_provider = "myrelay"
+
+[model_providers.myrelay]
+base_url = "https://relay.example/v1"
+
+[model_providers.idle]
+base_url = "https://idle.example/v1"
+
+[model_providers.amazon-bedrock]
+base_url = "https://bedrock.example/v1"
+"#;
+        let prepared =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), config)
+                .expect("prepare live config");
+        assert!(
+            prepared.contains("name = \"myrelay\"") && prepared.contains("name = \"idle\""),
+            "custom tables (active or not) must get a non-empty name; got:\n{prepared}"
+        );
+        assert!(
+            !prepared.contains("name = \"amazon-bedrock\""),
+            "bedrock tables must never receive a name; got:\n{prepared}"
+        );
+
+        // The keyless path (official cards, key-less providers) writes the
+        // same file and must normalize too.
+        let keyless = prepare_codex_provider_live_config(&json!({}), config)
+            .expect("prepare live config without token");
+        assert!(
+            keyless.contains("name = \"myrelay\"") && keyless.contains("name = \"idle\""),
+            "the keyless path must backfill names too; got:\n{keyless}"
+        );
     }
 
     #[test]
