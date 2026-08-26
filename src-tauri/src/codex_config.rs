@@ -3033,6 +3033,70 @@ fn normalize_codex_legacy_openai_reroute(config_text: &str) -> Result<Option<Str
     Ok(Some(doc.to_string()))
 }
 
+/// Align the active custom provider table's `requires_openai_auth` with the
+/// login-preservation setting on a third-party switch.
+///
+/// On Codex 0.149 the flag never decides request auth for these tables —
+/// `resolve_provider_auth` short-circuits on `env_key` /
+/// `experimental_bearer_token` before consulting it — but it does drive the
+/// login UX: `true` with no login in `auth.json` traps the TUI in the
+/// login/onboarding screen (preservation off deletes the file on every
+/// third-party switch), while `false` next to a preserved ChatGPT login
+/// makes Codex treat the session as logged out (account state hidden, the
+/// preserved tokens never refreshed). Stored third-party configs cannot be
+/// trusted here: presets and the custom template carried
+/// `requires_openai_auth = true` from the pre-0.149 era when auth.json held
+/// the third-party key, so the stamp overrides whatever the card says.
+///
+/// Only tables that short-circuit request auth (`env_key` or an
+/// injected/stored `experimental_bearer_token`) are touched. Stamping
+/// `true` on a table without a short-circuit would route request auth to
+/// the preserved official OAuth login — the exact leak the safety gates
+/// refuse — and keyless header-auth or local-server tables must keep their
+/// user-authored shape (0.149 keeps them unauthenticated either way).
+fn align_codex_requires_openai_auth_with_login_preservation(
+    config_text: &str,
+    preserve_official_login: bool,
+) -> Result<String, AppError> {
+    if !config_text.contains("model_providers") {
+        return Ok(config_text.to_string());
+    }
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let Some(provider_id) = active_codex_model_provider_id(&doc) else {
+        return Ok(config_text.to_string());
+    };
+    if !is_custom_codex_model_provider_id(&provider_id) {
+        return Ok(config_text.to_string());
+    }
+    let Some(provider_table) = doc
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|table| table.get_mut(provider_id.as_str()))
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return Ok(config_text.to_string());
+    };
+    let short_circuits_request_auth = provider_table.get("experimental_bearer_token").is_some()
+        || provider_table.get("env_key").is_some();
+    if !short_circuits_request_auth {
+        return Ok(config_text.to_string());
+    }
+    if provider_table
+        .get("requires_openai_auth")
+        .and_then(|item| item.as_bool())
+        == Some(preserve_official_login)
+    {
+        return Ok(config_text.to_string());
+    }
+    provider_table.insert(
+        "requires_openai_auth",
+        toml_edit::value(preserve_official_login),
+    );
+    Ok(doc.to_string())
+}
+
 fn set_codex_experimental_bearer_token(config_text: &str, token: &str) -> Result<String, AppError> {
     if config_text.trim().is_empty() {
         return Err(AppError::localized(
@@ -3504,6 +3568,7 @@ fn plan_codex_live_write(
     category: Option<&str>,
     auth: &Value,
     config_text: Option<&str>,
+    preserve_official_login: bool,
 ) -> Result<CodexLiveWritePlan, AppError> {
     // Semantic preflight over EVERY provider table (official and
     // third-party alike, idle tables included): field combinations 0.149
@@ -3586,12 +3651,14 @@ fn plan_codex_live_write(
     };
     let config_text = normalized.as_deref().or(config_text);
 
-    // The preservation setting now means exactly one thing: does the
-    // official login in auth.json survive a third-party switch? Off means
-    // the file is deleted — a lingering login next to a third-party route is
-    // the leak shape the gates exist to prevent, and `{}` is not logout, the
-    // file must go (see clear_stale_codex_live_auth_after_official_switch).
-    let remove_auth_file = !crate::settings::preserve_codex_official_auth_on_switch();
+    // The preservation setting decides whether the official login in
+    // auth.json survives a third-party switch. Off means the file is
+    // deleted — a lingering login next to a third-party route is the leak
+    // shape the gates exist to prevent, and `{}` is not logout, the file
+    // must go (see clear_stale_codex_live_auth_after_official_switch). The
+    // active table's `requires_openai_auth` is stamped to match below, so
+    // Codex's login UX agrees with the file state either way.
+    let remove_auth_file = !preserve_official_login;
 
     let live_config = match config_text {
         Some(text) if !text.trim().is_empty() => {
@@ -3622,6 +3689,13 @@ fn plan_codex_live_write(
         // without a key the empty config is passed through as-is.
         other => prepare_codex_provider_live_config(auth, other.unwrap_or(""))?,
     };
+    // After injection, so the stamp sees the final credential shape. Only
+    // this direct-switch plan stamps: the takeover subsystem preserves the
+    // login unconditionally and keeps its existing config shapes.
+    let live_config = align_codex_requires_openai_auth_with_login_preservation(
+        &live_config,
+        preserve_official_login,
+    )?;
 
     Ok(CodexLiveWritePlan {
         write_full_auth: false,
@@ -3639,7 +3713,13 @@ pub fn preflight_codex_live_write(
     auth: &Value,
     config_text: Option<&str>,
 ) -> Result<(), AppError> {
-    plan_codex_live_write(category, auth, config_text).map(|_| ())
+    plan_codex_live_write(
+        category,
+        auth,
+        config_text,
+        crate::settings::preserve_codex_official_auth_on_switch(),
+    )
+    .map(|_| ())
 }
 
 pub fn write_codex_live_for_provider(
@@ -3647,7 +3727,12 @@ pub fn write_codex_live_for_provider(
     auth: &Value,
     config_text: Option<&str>,
 ) -> Result<(), AppError> {
-    let plan = plan_codex_live_write(category, auth, config_text)?;
+    let plan = plan_codex_live_write(
+        category,
+        auth,
+        config_text,
+        crate::settings::preserve_codex_official_auth_on_switch(),
+    )?;
     if plan.write_full_auth {
         return write_codex_live_atomic(auth, plan.config_text.as_deref());
     }
@@ -5446,7 +5531,7 @@ base_url = "https://idle.example/v1"
 [model_providers.amazon-bedrock]
 base_url = "https://bedrock.example/v1"
 "#;
-        let plan = plan_codex_live_write(Some("official"), &json!({}), Some(config))
+        let plan = plan_codex_live_write(Some("official"), &json!({}), Some(config), false)
             .expect("official plan");
         let written = plan.config_text.expect("official plan carries config");
         assert!(
@@ -5457,6 +5542,104 @@ base_url = "https://bedrock.example/v1"
             !written.contains("name = \"amazon-bedrock\""),
             "bedrock tables must never receive a name; got:\n{written}"
         );
+    }
+
+    #[test]
+    fn third_party_plan_stamps_requires_openai_auth_to_match_preservation() {
+        // Presets and the custom template shipped `requires_openai_auth =
+        // true` from the pre-0.149 era (auth.json carried the third-party
+        // key back then). On 0.149 the injected bearer decides request auth
+        // either way, but the flag drives the login UX: true with auth.json
+        // deleted (preservation off) traps the TUI in the login screen,
+        // false next to a preserved login hides the official account and
+        // lets its tokens go stale. The plan overrides the stored value
+        // with the preservation setting.
+        let auth = json!({"OPENAI_API_KEY": "sk-test"});
+        let stale_true = "model_provider = \"relay\"\n\n[model_providers.relay]\nname = \"Relay\"\nbase_url = \"https://relay.example/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n";
+
+        let off = plan_codex_live_write(None, &auth, Some(stale_true), false)
+            .expect("third-party plan with preservation off");
+        let off_text = off.config_text.expect("plan carries config");
+        assert!(
+            off_text.contains("requires_openai_auth = false")
+                && !off_text.contains("requires_openai_auth = true"),
+            "preservation off must stamp the stale flag to false; got:\n{off_text}"
+        );
+        assert!(
+            off_text.contains("experimental_bearer_token = \"sk-test\""),
+            "the bearer injection must be unaffected; got:\n{off_text}"
+        );
+        assert!(off.remove_auth_file, "preservation off deletes auth.json");
+
+        let on = plan_codex_live_write(None, &auth, Some(stale_true), true)
+            .expect("third-party plan with preservation on");
+        let on_text = on.config_text.expect("plan carries config");
+        assert!(
+            on_text.contains("requires_openai_auth = true"),
+            "preservation on must keep/stamp the flag true; got:\n{on_text}"
+        );
+        assert!(!on.remove_auth_file, "preservation on keeps auth.json");
+
+        // A card that never carried the flag gets it stamped too — the
+        // preserved login stays visible to Codex (account state + token
+        // refresh) only through requires_openai_auth = true.
+        let flagless = "model_provider = \"relay\"\n\n[model_providers.relay]\nname = \"Relay\"\nbase_url = \"https://relay.example/v1\"\nwire_api = \"responses\"\n";
+        let on_flagless = plan_codex_live_write(None, &auth, Some(flagless), true)
+            .expect("third-party plan for a flagless card");
+        let on_flagless_text = on_flagless.config_text.expect("plan carries config");
+        assert!(
+            on_flagless_text.contains("requires_openai_auth = true"),
+            "preservation on must stamp flagless cards; got:\n{on_flagless_text}"
+        );
+    }
+
+    #[test]
+    fn requires_openai_auth_stamp_only_touches_tables_with_a_request_auth_short_circuit() {
+        // Keyless header-auth card: no env_key / bearer short-circuit, so
+        // stamping true would route request auth to the preserved OAuth
+        // login (applied after provider headers — the leak the gates
+        // refuse). It must keep its user-authored shape under both
+        // settings; 0.149 resolves it as unauthenticated and the static
+        // header survives.
+        let header_auth = "model_provider = \"hdr\"\n\n[model_providers.hdr]\nname = \"Header\"\nbase_url = \"https://hdr.example/v1\"\nwire_api = \"responses\"\nhttp_headers = { Authorization = \"Bearer sk-static\" }\n";
+        for preserve in [false, true] {
+            let plan = plan_codex_live_write(None, &json!({}), Some(header_auth), preserve)
+                .expect("keyless header-auth plan");
+            let text = plan.config_text.expect("plan carries config");
+            assert!(
+                !text.contains("requires_openai_auth"),
+                "header-auth cards must not be stamped (preserve={preserve}); got:\n{text}"
+            );
+        }
+
+        // env_key short-circuits request auth on 0.149 just like the
+        // bearer, so the stamp applies: a stale true would otherwise trap
+        // the TUI in the login screen once auth.json is deleted.
+        let env_key = "model_provider = \"envd\"\n\n[model_providers.envd]\nname = \"EnvKey\"\nbase_url = \"https://envd.example/v1\"\nwire_api = \"responses\"\nenv_key = \"MY_KEY\"\nrequires_openai_auth = true\n";
+        let plan = plan_codex_live_write(None, &json!({}), Some(env_key), false)
+            .expect("env_key plan with preservation off");
+        let text = plan.config_text.expect("plan carries config");
+        assert!(
+            text.contains("requires_openai_auth = false"),
+            "env_key cards must be stamped like bearer cards; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn requires_openai_auth_stamp_is_a_noop_when_already_aligned() {
+        let aligned = "model_provider = \"relay\"\n\n[model_providers.relay]\nname = \"Relay\"\nbase_url = \"https://relay.example/v1\"\nexperimental_bearer_token = \"sk-test\"\nrequires_openai_auth = false\n";
+        let output = align_codex_requires_openai_auth_with_login_preservation(aligned, false)
+            .expect("align");
+        assert_eq!(
+            output, aligned,
+            "an aligned config must pass through untouched"
+        );
+
+        // No custom-table route → nothing to stamp.
+        let no_route = "model = \"gpt-5.6\"\n";
+        let output = align_codex_requires_openai_auth_with_login_preservation(no_route, true)
+            .expect("align");
+        assert_eq!(output, no_route);
     }
 
     #[test]
