@@ -788,7 +788,6 @@ impl MultiAppConfig {
         for app in [
             AppType::Claude,
             AppType::Codex,
-            AppType::Cursor,
             AppType::Gemini,
             AppType::GrokBuild,
             AppType::OpenCode,
