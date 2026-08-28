@@ -513,7 +513,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn save_settings_should_preserve_existing_shared_memory_when_payload_omits_it() {
         let existing = AppSettings {
             shared_memory: Some(SharedMemorySettings {
@@ -613,6 +612,7 @@ mod tests {
             Some("new-token")
         );
     }
+    #[test]
     fn save_settings_should_preserve_local_migrations_when_payload_omits_it() {
         let existing = AppSettings {
             local_migrations: Some(LocalMigrations {
