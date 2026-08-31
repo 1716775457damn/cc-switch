@@ -46,6 +46,10 @@ pub fn shared_memory_save_settings(mut incoming: SharedMemorySettings) -> Result
         if incoming.token.is_empty() && !existing.token.is_empty() {
             incoming.token = existing.token;
         }
+        // 保留后端管理的同步元数据，避免仅保存 url/token 时被重置。
+        incoming.enabled = existing.enabled;
+        incoming.last_sync_at = existing.last_sync_at;
+        incoming.last_sync_bytes = existing.last_sync_bytes;
     }
     incoming.normalize();
     incoming.validate().map_err(|e| e.to_string())?;
@@ -67,7 +71,23 @@ pub async fn shared_memory_fetch() -> Result<Value, String> {
         .text()
         .await
         .map_err(|e| AppError::Message(format!("共享记忆响应读取失败: {e}")).to_string())?;
-    parse_cloud_response(status, body).map_err(|e| e.to_string())
+    let data = parse_cloud_response(status, body).map_err(|e| e.to_string())?;
+
+    // 与 Push 一致：拉取成功后持久化同步元数据。
+    let updated_at = data
+        .get("updatedAt")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let bytes = data.get("bytes").and_then(|v| v.as_u64());
+    if updated_at.is_some() || bytes.is_some() {
+        if let Some(mut sm) = settings::get_shared_memory_settings() {
+            sm.last_sync_at = updated_at;
+            sm.last_sync_bytes = bytes;
+            sm.enabled = true;
+            let _ = settings::set_shared_memory_settings(Some(sm));
+        }
+    }
+    Ok(data)
 }
 
 /// 推送共享记忆到云端（PUT {url}/api，X-Auth-Token）。
