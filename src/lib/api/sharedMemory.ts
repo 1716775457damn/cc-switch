@@ -25,7 +25,7 @@ export const sharedMemoryApi = {
   async saveSettings(
     settings: SharedMemorySettings,
   ): Promise<{ success: boolean }> {
-    return await invoke("shared_memory_save_settings", { settings });
+    return await invoke("shared_memory_save_settings", { incoming: settings });
   },
 
   /** 从云端拉取共享记忆。 */
