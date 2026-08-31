@@ -212,7 +212,7 @@ const SharedMemoryPanel: React.FC = () => {
           <Button
             variant="outline"
             onClick={() => void handleFetch()}
-            disabled={fetching || !settingsLoaded}
+            disabled={fetching || pushing || !settingsLoaded}
           >
             {fetching ? (
               <Loader2 className="w-4 h-4 animate-spin mr-1" />
@@ -223,7 +223,7 @@ const SharedMemoryPanel: React.FC = () => {
           </Button>
           <Button
             onClick={() => void handlePush()}
-            disabled={pushing || !settingsLoaded}
+            disabled={pushing || fetching || !settingsLoaded}
           >
             {pushing ? (
               <Loader2 className="w-4 h-4 animate-spin mr-1" />
